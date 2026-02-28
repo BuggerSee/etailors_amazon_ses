@@ -324,38 +324,19 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
      */
     private function processFailures(array $failures): void
     {
-        $this->logger->debug('proces failures:');
-        $this->logger->debug(json_encode($failures));
-
         if (empty($failures)) {
             return;
         }
-        // Make a copy of the metadata
-        $metadata = $this->getMetadata();
-        $keys     = array_keys($metadata);
 
-        // Clear the metadata
-        $this->message->clearMetadata();
-
-        // Add the metadata for the failed recipients
-
-        if (!empty($metadata)) {
-            foreach ($failures as $failure) {
-                if (is_int($failure)) {
-                    $this->message->addMetadata($keys[$failure], $metadata[$keys[$failure]]);
-                } else {
-                    $this->message->addMetadata($failure, $metadata[$failure]);
-                }
-            }
-        }
-
-        $this->logger->debug('There are partial failures, replacing metadata, and failing the message');
-        /*
-            The message that failed will be retried with only the failed recipients
-            This transport assume that the queue mode is enabled
-        */
-
-        throw new \Exception('There are  '.count($failures).' partial failures, check logs for exception reasons');
+        // Log failures but do NOT throw. Throwing causes Symfony Messenger to retry
+        // the ENTIRE message with ALL recipients (metadata modifications are lost during
+        // re-serialization), resulting in duplicate sends. Failed recipients were already
+        // retried inline in doSend() with exponential backoff.
+        $this->logger->error(sprintf(
+            '%d recipients failed after inline retry: %s',
+            count($failures),
+            implode(', ', $failures)
+        ));
     }
 
     /**
