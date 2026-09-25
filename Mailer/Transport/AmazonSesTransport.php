@@ -92,6 +92,7 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
        'BCC',
     ];
 
+    private $enableTemplate;
     private $entityManager;
     private PathsHelper $pathsHelper;
     private MauticMessage $message;
@@ -102,6 +103,7 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
     private LoggerInterface $logger;
 
     private array $settings;
+    private ?SharedTemplateCompiler $compiler = null;
 
     public function __construct(
         SesV2Client $amazonclient,
@@ -128,7 +130,7 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
          * Mailer should process tokinzed emails one by one
          * This transport SHOULD NOT RUN IN PARALLEL.
          */
-        $this->setMaxPerSecond(('auto' === ($settings['bulk'] ?? 'off')) ? 0 : 1);
+        $this->setMaxPerSecond(1);
     }
 
     public function __toString(): string
@@ -164,15 +166,19 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
             $this->updateEmailFields($email);
 
             if ('auto' === ($this->settings['bulk'] ?? 'off') && $this->canIdentifyRecipients($email)) {
-                $this->sendWithBulkAdapter();
+                $reason = $this->bulkEligibilityReason(BulkSender::scope($this->client));
+                if (null === $reason) {
+                    $this->sendWithBulkAdapter();
 
-                return;
+                    return;
+                }
+                $this->logger->info('SES raw sending: message is not eligible for shared templates.', ['reason' => $reason, 'email_id' => $this->getEmailIdFromMetadata($email->getMetadata())]);
             }
 
             $failures = [];
 
             // Handle attachment or non-template emails
-            {
+            if ($email->getAttachments() || !$this->enableTemplate) {
                 $this->logger->debug('attachments OR NOT template');
                 $this->logger->debug('sendrate:' . $this->settings['maxSendRate']);
 
@@ -352,39 +358,29 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
         return count($due);
     }
 
+    /** Judged on the first recipient only, before anything is persisted, charged or submitted. */
+    private function bulkEligibilityReason(string $scope): ?string
+    {
+        $metadata = $this->message->getMetadata();
+        $recipient = array_key_first($metadata);
+        try {
+            $this->bulkEntry($scope, $recipient, $metadata[$recipient]);
+        } catch (IneligibleMessage $e) {
+            return $e->getMessage();
+        }
+
+        return null;
+    }
+
     private function bulkDeliveries(string $scope): \Generator
     {
-        $compiler = new SharedTemplateCompiler();
         foreach ($this->message->getMetadata() as $recipient => $data) {
-            $id = hash('sha256', $scope.'|'.$data['emailId'].'|'.$data['hashId'].'|'.$recipient);
             $reason = '';
             try {
-                $compiled = $compiler->compile($this->message, $data['tokens'] ?? []);
-                // Only headers need local replacement. Shared bodies are not rendered/serialized here.
-                $headers = clone $this->message;
-                $headers->clearMetadata();
-                $headers->html(null)->text(null)->subject('');
-                $headers->to(new Address($recipient, $data['name'] ?? ''));
-                $tokens = $data['tokens'] ?? [];
-                ksort($tokens);
-                MailHelper::searchReplaceTokens(array_keys($tokens), $tokens, $headers);
-                $common = [];
-                $this->addSesHeaders($common, $headers, $data);
-                $tags = $common['EmailTags'] ?? [];
-                unset($common['EmailTags']);
-                $tags = $this->deliveryTag($tags, $id);
-                $entry = [
-                    'Destination' => ['ToAddresses' => $this->stringifyAddresses($headers->getTo())],
-                    'ReplacementEmailContent' => ['ReplacementTemplate' => ['ReplacementTemplateData' => $compiled['data']]],
-                    'ReplacementHeaders' => $this->bulkHeaders($headers),
-                    'ReplacementTags' => $tags,
-                ];
-                $common['DefaultContent'] = ['Template' => ['TemplateContent' => $compiled['template'], 'TemplateData' => '{}']];
-                if (BulkBatcher::bytes(BulkBatcher::request($common, [$entry])) > BulkBatcher::MAX_BYTES) {
-                    throw new IneligibleMessage('request_size');
-                }
+                ['id' => $id, 'common' => $common, 'entry' => $entry] = $this->bulkEntry($scope, $recipient, $data);
                 $operation = 'bulk';
             } catch (IneligibleMessage $e) {
+                $id = $this->deliveryId($scope, $recipient, $data);
                 $reason = $e->getMessage();
                 $common = $this->rawRecipient($recipient, $data);
                 $common['EmailTags'] = $this->deliveryTag($common['EmailTags'] ?? [], $id);
@@ -395,6 +391,48 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
             }
             yield ['id' => $id, 'tracking_hash' => $data['hashId'], 'email_id' => (int) $data['emailId'], 'operation' => $operation, 'common' => $common, 'entry' => $entry, 'reason' => $reason];
         }
+    }
+
+    /**
+     * @return array{id: string, common: array, entry: array}
+     *
+     * @throws IneligibleMessage
+     */
+    private function bulkEntry(string $scope, string $recipient, array $data): array
+    {
+        $id = $this->deliveryId($scope, $recipient, $data);
+        $this->compiler ??= new SharedTemplateCompiler();
+        $compiled = $this->compiler->compile($this->message, $data['tokens'] ?? []);
+        // Only headers need local replacement. Shared bodies are not rendered/serialized here.
+        $headers = clone $this->message;
+        $headers->clearMetadata();
+        $headers->html(null)->text(null)->subject('');
+        $headers->to(new Address($recipient, $data['name'] ?? ''));
+        $tokens = $data['tokens'] ?? [];
+        ksort($tokens);
+        MailHelper::searchReplaceTokens(array_keys($tokens), $tokens, $headers);
+        $common = [];
+        $this->addSesHeaders($common, $headers, $data);
+        $tags = $common['EmailTags'] ?? [];
+        unset($common['EmailTags']);
+        $tags = $this->deliveryTag($tags, $id);
+        $entry = [
+            'Destination' => ['ToAddresses' => $this->stringifyAddresses($headers->getTo())],
+            'ReplacementEmailContent' => ['ReplacementTemplate' => ['ReplacementTemplateData' => $compiled['data']]],
+            'ReplacementHeaders' => $this->bulkHeaders($headers),
+            'ReplacementTags' => $tags,
+        ];
+        $common['DefaultContent'] = ['Template' => ['TemplateContent' => $compiled['template'], 'TemplateData' => '{}']];
+        if (BulkBatcher::bytes(BulkBatcher::request($common, [$entry])) > BulkBatcher::MAX_BYTES) {
+            throw new IneligibleMessage('request_size');
+        }
+
+        return ['id' => $id, 'common' => $common, 'entry' => $entry];
+    }
+
+    private function deliveryId(string $scope, string $recipient, array $data): string
+    {
+        return hash('sha256', $scope.'|'.$data['emailId'].'|'.$data['hashId'].'|'.$recipient);
     }
 
     private function deliveryTag(array $tags, string $id): array
