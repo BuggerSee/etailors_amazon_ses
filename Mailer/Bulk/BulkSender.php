@@ -29,59 +29,66 @@ final class BulkSender
         }
     }
 
-    /** @param callable(int): void $acquire */
-    public function send(SesV2Client $client, array $ids, callable $acquire, int $concurrency = 1): void
+    /**
+     * @param iterable<list<string>> $batches each batch becomes one request per content group; batches are never merged
+     * @param callable(int): void    $acquire
+     */
+    public function send(SesV2Client $client, iterable $batches, callable $acquire, int $concurrency = 1): void
     {
         $scope = self::scope($client);
         $owner = bin2hex(random_bytes(16));
-        $groups = [];
-        foreach ($ids as $id) {
-            if ($row = $this->store->claim($id, $scope, $owner)) {
-                $groups[$row['content_id']][] = $row;
-            }
-        }
         // Submitted requests, oldest first: [promise, rows, content, content id].
         $inFlight = [];
+        // Claimed rows of the current batch that have not been submitted, by content id.
+        $pending = [];
         try {
-            foreach ($groups as $contentId => $rows) {
-                if (count($inFlight) >= max(1, $concurrency)) {
-                    // The window is full: record the oldest outcome before submitting another request.
-                    $this->settle(...array_shift($inFlight));
+            foreach ($batches as $ids) {
+                // Claim one batch at a time, so rows of later batches stay untouched until their turn.
+                foreach ($ids as $id) {
+                    if ($row = $this->store->claim($id, $scope, $owner)) {
+                        $pending[$row['content_id']][] = $row;
+                    }
                 }
-                $content = $this->store->content($contentId);
-                $entries = array_map(static fn (array $row): array => json_decode($row['entry'], true, 512, JSON_THROW_ON_ERROR), $rows);
-                if ('bulk' === $content['operation']) {
-                    $request = BulkBatcher::request($content['payload'], $entries);
-                    $operation = 'SendBulkEmail';
-                    $recipients = count($entries);
-                } else {
-                    $request = $content['payload'];
-                    $request['Content']['Raw']['Data'] = base64_decode($request['Content']['Raw']['Data'], true);
-                    $operation = 'SendEmail';
-                    $recipients = array_sum(array_map('count', $request['Destination']));
-                }
-                try {
+                foreach ($pending as $contentId => $rows) {
+                    if (count($inFlight) >= max(1, $concurrency)) {
+                        // The window is full: record the oldest outcome before submitting another request.
+                        $this->settle(...array_shift($inFlight));
+                    }
+                    $content = $this->store->content($contentId);
+                    $entries = array_map(static fn (array $row): array => json_decode($row['entry'], true, 512, JSON_THROW_ON_ERROR), $rows);
+                    if ('bulk' === $content['operation']) {
+                        $request = BulkBatcher::request($content['payload'], $entries);
+                        $operation = 'SendBulkEmail';
+                        $recipients = count($entries);
+                    } else {
+                        $request = $content['payload'];
+                        $request['Content']['Raw']['Data'] = base64_decode($request['Content']['Raw']['Data'], true);
+                        $operation = 'SendEmail';
+                        $recipients = array_sum(array_map('count', $request['Destination']));
+                    }
                     $acquire($recipients);
                     $this->store->recordRequest($contentId, BulkBatcher::bytes($request));
-                } catch (\Throwable $e) {
-                    // Nothing has been submitted; releasing the claim for a later retry is safe.
-                    foreach ($rows as $row) {
-                        $this->store->complete($row, 'retry', 'local_preflight_failure');
+                    // From here on the request may reach SES, so its outcome is recorded rather than released.
+                    unset($pending[$contentId]);
+                    try {
+                        // Disable hidden whole-request retries. Outcome handling belongs to this ledger.
+                        $command = $client->getCommand($operation, $request + [
+                            '@retries' => 0,
+                            '@http' => ['connect_timeout' => 10, 'timeout' => 60],
+                        ]);
+                        $inFlight[] = [$client->executeAsync($command), $rows, $content, $contentId];
+                    } catch (\Throwable $e) {
+                        $this->recordFailure($rows, $e);
                     }
-                    throw $e;
-                }
-                try {
-                    // Disable hidden whole-request retries. Outcome handling belongs to this ledger.
-                    $command = $client->getCommand($operation, $request + [
-                        '@retries' => 0,
-                        '@http' => ['connect_timeout' => 10, 'timeout' => 60],
-                    ]);
-                    $inFlight[] = [$client->executeAsync($command), $rows, $content, $contentId];
-                } catch (\Throwable $e) {
-                    $this->recordFailure($rows, $e);
                 }
             }
         } finally {
+            // A local step failed before these claims were submitted; releasing them for a later retry is safe.
+            foreach ($pending as $rows) {
+                foreach ($rows as $row) {
+                    $this->store->complete($row, 'retry', 'local_preflight_failure');
+                }
+            }
             // Submitted requests are recorded even when a later request fails its preflight.
             while ($inFlight) {
                 $this->settle(...array_shift($inFlight));

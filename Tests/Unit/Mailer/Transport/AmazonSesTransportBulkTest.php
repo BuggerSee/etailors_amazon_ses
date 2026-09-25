@@ -10,6 +10,7 @@ use Doctrine\ORM\EntityManager;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\EntityRepository;
 use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Promise\Promise;
 use Mautic\CoreBundle\Helper\PathsHelper;
 use Mautic\EmailBundle\Mailer\Message\MauticMessage;
 use MauticPlugin\AmazonSesBundle\Mailer\Bulk\BulkSender;
@@ -154,6 +155,43 @@ class AmazonSesTransportBulkTest extends TestCase
         self::assertSame($due, array_column($entries[0]['ReplacementTags'], 'Value', 'Name')['mautic_delivery_id']);
     }
 
+    /**
+     * @dataProvider windows
+     */
+    public function testRequestsOfOneMessageArePipelined(int $concurrency, array $expected): void
+    {
+        $answeredAtCall = $this->deferResponses();
+        // One recipient per request, so the two recipients need two requests.
+        $this->transport(['bulkBatchSize' => 1, 'bulkConcurrency' => $concurrency])->send($this->message());
+
+        self::assertSame(['SendBulkEmail', 'SendBulkEmail'], array_column($this->calls, 0));
+        self::assertSame($expected, $answeredAtCall->getArrayCopy());
+        self::assertSame([['bulk', 'accepted', '', 2]], $this->recipients());
+    }
+
+    public static function windows(): array
+    {
+        return [
+            // The second request reaches SES before the first response arrives.
+            'window of two' => [2, [0, 0]],
+            // Without a window the second request waits for the first response.
+            'window of one' => [1, [0, 1]],
+        ];
+    }
+
+    public function testOutboxRetryIsPipelined(): void
+    {
+        $answeredAtCall = $this->deferResponses();
+        $scope = BulkSender::scope($this->client);
+        $this->store->enqueue(DeliveryStoreTest::delivery('a'), $scope);
+        $this->store->enqueue(DeliveryStoreTest::delivery('b'), $scope);
+
+        self::assertSame(2, $this->transport(['bulkBatchSize' => 1, 'bulkConcurrency' => 2])->retryBulk());
+        self::assertSame(['SendBulkEmail', 'SendBulkEmail'], array_column($this->calls, 0));
+        self::assertSame([0, 0], $answeredAtCall->getArrayCopy());
+        self::assertSame([['bulk', 'accepted', '', 2]], $this->recipients());
+    }
+
     private function transport(array $settings = [], bool $bulkServices = true): AmazonSesTransport
     {
         $paths = $this->createMock(PathsHelper::class);
@@ -172,6 +210,31 @@ class AmazonSesTransportBulkTest extends TestCase
             $bulkServices ? $this->store : null,
             $bulkServices ? new BulkSender($this->store, new NullLogger()) : null,
         );
+    }
+
+    /**
+     * Responses stay open until the sender waits; each wait answers the oldest open request, as if responses arrived in order.
+     * Every request is answered with one successful entry, so requests must carry one recipient each.
+     *
+     * @return \ArrayObject<int, int> for each request, the number of answered requests when it reached SES
+     */
+    private function deferResponses(): \ArrayObject
+    {
+        $open = [];
+        $answered = 0;
+        $answeredAtCall = new \ArrayObject();
+        $wait = static function () use (&$open, &$answered): void {
+            $open[$answered]->resolve(new Result(['BulkEmailEntryResults' => [['Status' => 'SUCCESS', 'MessageId' => 'bulk-'.$answered]]]));
+            ++$answered;
+        };
+        $this->client = BulkSenderTest::client(function ($command) use (&$open, &$answered, $answeredAtCall, $wait): Promise {
+            $this->calls[] = [$command->getName(), $command->toArray()];
+            $answeredAtCall[] = $answered;
+
+            return $open[] = new Promise($wait);
+        });
+
+        return $answeredAtCall;
     }
 
     private function message(array $tokensB = []): MauticMessage

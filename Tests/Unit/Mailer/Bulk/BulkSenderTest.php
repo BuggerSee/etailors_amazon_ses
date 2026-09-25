@@ -35,12 +35,12 @@ class BulkSenderTest extends TestCase
         $sender = new BulkSender($store, new NullLogger());
         $tokens = [];
         $acquire = static function (int $count) use (&$tokens): void { $tokens[] = $count; };
-        $sender->send($client, $ids, $acquire);
+        $sender->send($client, [$ids], $acquire);
         // Replaying the original queue job cannot resend accepted or not-yet-due entries.
-        $sender->send($client, $ids, $acquire);
+        $sender->send($client, [$ids], $acquire);
         self::assertCount(1, $calls);
         $em->getConnection()->executeStatement('UPDATE ses_bulk_deliveries SET next_attempt = 0');
-        $sender->send($client, $ids, $acquire);
+        $sender->send($client, [$ids], $acquire);
         self::assertSame([2, 1], $tokens);
         self::assertCount(1, $calls[1]['BulkEmailEntries']);
         self::assertSame(0, $calls[0]['@retries']);
@@ -58,8 +58,8 @@ class BulkSenderTest extends TestCase
         $store->install();
         $id = $store->enqueue(DeliveryStoreTest::delivery(), BulkSender::scope($client));
         $sender = new BulkSender($store, new NullLogger());
-        $sender->send($client, [$id], static fn () => null);
-        $sender->send($client, [$id], static fn () => null);
+        $sender->send($client, [[$id]], static fn () => null);
+        $sender->send($client, [[$id]], static fn () => null);
         self::assertSame(1, $calls);
         self::assertSame('unknown', $store->summary()['recipients'][0]['state']);
     }
@@ -70,7 +70,7 @@ class BulkSenderTest extends TestCase
         $store = new DeliveryStore(DeliveryStoreTest::manager());
         $store->install();
         $ids = [$store->enqueue(DeliveryStoreTest::delivery('a'), BulkSender::scope($client)), $store->enqueue(DeliveryStoreTest::delivery('b'), BulkSender::scope($client))];
-        (new BulkSender($store, new NullLogger()))->send($client, $ids, static fn () => null);
+        (new BulkSender($store, new NullLogger()))->send($client, [$ids], static fn () => null);
         self::assertSame('unknown', $store->summary()['recipients'][0]['state']);
         self::assertSame(2, (int) $store->summary()['recipients'][0]['recipients']);
     }
@@ -99,33 +99,63 @@ class BulkSenderTest extends TestCase
         $store = new DeliveryStore($em);
         $store->install();
         $ids = self::enqueueGroups($store, $client, ['a', 'b']);
-        (new BulkSender($store, new NullLogger()))->send($client, $ids, static fn () => null, 2);
+        (new BulkSender($store, new NullLogger()))->send($client, [$ids], static fn () => null, 2);
         self::assertSame('retry', self::state($em, $ids[0]));
         self::assertSame('accepted', self::state($em, $ids[1]));
     }
 
-    public function testPreflightFailureStillRecordsSubmittedRequests(): void
+    /**
+     * @dataProvider localFailures
+     */
+    public function testPreflightFailureStillRecordsSubmittedRequests(string $step, string $message): void
     {
         $client = self::client(static fn () => Create::promiseFor(new Result(['BulkEmailEntryResults' => [['Status' => 'SUCCESS', 'MessageId' => 'a-id']]])));
         $em = DeliveryStoreTest::manager();
         $store = new DeliveryStore($em);
         $store->install();
-        $ids = self::enqueueGroups($store, $client, ['a', 'b']);
+        $ids = self::enqueueGroups($store, $client, ['a', 'b', 'c']);
         $calls = 0;
-        $acquire = static function () use (&$calls): void {
-            if (2 === ++$calls) {
+        $acquire = static function () use (&$calls, $step): void {
+            if ('acquire' === $step && 2 === ++$calls) {
                 throw new \RuntimeException('Token bucket unavailable');
             }
         };
-        try {
-            (new BulkSender($store, new NullLogger()))->send($client, $ids, $acquire, 2);
-            self::fail('The preflight failure must propagate.');
-        } catch (\RuntimeException $e) {
-            self::assertSame('Token bucket unavailable', $e->getMessage());
+        if ('content' === $step) {
+            $em->getConnection()->executeStatement('DELETE FROM ses_bulk_contents WHERE id = (SELECT content_id FROM ses_bulk_deliveries WHERE id = ?)', [$ids[1]]);
         }
-        // The first request was already in flight; its outcome is recorded, not left in 'sending'.
-        self::assertSame('accepted', self::state($em, $ids[0]));
-        self::assertSame('retry', self::state($em, $ids[1]));
+        try {
+            (new BulkSender($store, new NullLogger()))->send($client, [$ids], $acquire, 2);
+            self::fail('The local failure must propagate.');
+        } catch (\RuntimeException $e) {
+            self::assertSame($message, $e->getMessage());
+        }
+        // The first request was already in flight and is recorded; the failing group and the untried third are released.
+        self::assertSame(['accepted', 'retry', 'retry'], array_map(static fn (string $id): string => self::state($em, $id), $ids));
+    }
+
+    public static function localFailures(): array
+    {
+        return [
+            'token bucket'    => ['acquire', 'Token bucket unavailable'],
+            'missing content' => ['content', 'Missing persisted SES content.'],
+        ];
+    }
+
+    public function testBatchesWithTheSameContentAreNeverMerged(): void
+    {
+        $entries = [];
+        $client = self::client(static function ($command) use (&$entries) {
+            $entries[] = count($command['BulkEmailEntries']);
+
+            return Create::promiseFor(new Result(['BulkEmailEntryResults' => array_fill(0, count($command['BulkEmailEntries']), ['Status' => 'SUCCESS', 'MessageId' => 'id'])]));
+        });
+        $store = new DeliveryStore(DeliveryStoreTest::manager());
+        $store->install();
+        $scope = BulkSender::scope($client);
+        [$a, $b, $c] = array_map(static fn (string $name): string => $store->enqueue(DeliveryStoreTest::delivery($name), $scope), ['a', 'b', 'c']);
+        (new BulkSender($store, new NullLogger()))->send($client, [[$a, $b], [$c]], static fn () => null, 2);
+        self::assertSame([2, 1], $entries);
+        self::assertSame([['accepted', 3]], array_map(static fn (array $row): array => [$row['state'], (int) $row['recipients']], $store->summary()['recipients']));
     }
 
     public static function client(callable $handler): SesV2Client
@@ -152,7 +182,7 @@ class BulkSenderTest extends TestCase
         $store = new DeliveryStore(DeliveryStoreTest::manager());
         $store->install();
         $ids = self::enqueueGroups($store, $client, ['a', 'b', 'c']);
-        (new BulkSender($store, new NullLogger()))->send($client, $ids, static fn () => null, $concurrency);
+        (new BulkSender($store, new NullLogger()))->send($client, [$ids], static fn () => null, $concurrency);
         self::assertSame([['accepted', 3]], array_map(static fn (array $row): array => [$row['state'], (int) $row['recipients']], $store->summary()['recipients']));
 
         return $resolvedAtCall;
