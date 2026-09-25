@@ -30,6 +30,7 @@ use Symfony\Component\Mailer\Transport\Dsn;
 use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 use Symfony\Contracts\Translation\TranslatorInterface;
+use MauticPlugin\AmazonSesBundle\Mailer\Bulk\DeliveryStore;
 
 class CallbackSubscriber implements EventSubscriberInterface
 {
@@ -49,6 +50,7 @@ class CallbackSubscriber implements EventSubscriberInterface
         private SnsWebhookAuthenticator $snsWebhookAuthenticator,
         TranslatorInterface $translator,
         ?LoggerInterface $logger = null,
+        private ?DeliveryStore $deliveryStore = null,
     ) {
         $this->translator = $translator;
         $this->logger     = $logger;
@@ -184,6 +186,8 @@ class CallbackSubscriber implements EventSubscriberInterface
     {
         $this->logger?->debug('Start processJsonPayload:');
 
+        $this->deliveryStore?->recordEvent($payload, (string) $type);
+
         $typeFound = false;
         $hasError  = false;
         $message   = 'PROCESSED';
@@ -233,7 +237,9 @@ class CallbackSubscriber implements EventSubscriberInterface
                 try {
                     $message = json_decode($payload['Message'], true, 512, JSON_THROW_ON_ERROR);
                     $innerType = $message['notificationType'] ?? $message['eventType'] ?? 'unknown';
-                    $this->processJsonPayload($message, $innerType);
+                    $innerResult = $this->processJsonPayload($message, $innerType);
+                    $hasError = $innerResult['hasError'];
+                    $message = $innerResult['message'];
                 } catch (\Exception $e) {
                     $this->logger->error('AmazonCallback: Invalid Notification JSON Payload');
                     $hasError = true;
@@ -243,6 +249,9 @@ class CallbackSubscriber implements EventSubscriberInterface
                 break;
 
             case 'Delivery':
+            case 'Send':
+            case 'Rendering Failure':
+            case 'Reject':
                 // Nothing more to do here.
                 $typeFound = true;
 

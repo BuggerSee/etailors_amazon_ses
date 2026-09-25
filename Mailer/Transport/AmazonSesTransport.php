@@ -33,6 +33,12 @@ use Mautic\EmailBundle\Entity\Email as MauticEmailEntity;
 use Doctrine\ORM\EntityManagerInterface;
 use Mautic\CoreBundle\Helper\PathsHelper;
 use Symfony\Component\Mailer\Envelope;
+use MauticPlugin\AmazonSesBundle\Mailer\Bulk\BulkBatcher;
+use MauticPlugin\AmazonSesBundle\Mailer\Bulk\BulkSender;
+use MauticPlugin\AmazonSesBundle\Mailer\Bulk\DeliveryStore;
+use MauticPlugin\AmazonSesBundle\Mailer\Bulk\IneligibleMessage;
+use MauticPlugin\AmazonSesBundle\Mailer\Bulk\SharedTemplateCompiler;
+use Psr\Log\NullLogger;
 
 class AmazonSesTransport extends AbstractTransport implements TokenTransportInterface
 {
@@ -86,7 +92,6 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
        'BCC',
     ];
 
-    private $enableTemplate;
     private $entityManager;
     private PathsHelper $pathsHelper;
     private MauticMessage $message;
@@ -105,9 +110,11 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
         ?EventDispatcherInterface $dispatcher = null,
         ?LoggerInterface $logger = null,
         $settings = [],
+        private ?DeliveryStore $deliveryStore = null,
+        private ?BulkSender $bulkSender = null,
     ) {
         parent::__construct($dispatcher, $logger);
-        $this->logger     = $logger;
+        $this->logger     = $logger ?? new NullLogger();
         $this->client     = $amazonclient;
         $this->dispatcher = $dispatcher;
         $this->entityManager = $entityManager;
@@ -121,7 +128,7 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
          * Mailer should process tokinzed emails one by one
          * This transport SHOULD NOT RUN IN PARALLEL.
          */
-        $this->setMaxPerSecond(1);
+        $this->setMaxPerSecond(('auto' === ($settings['bulk'] ?? 'off')) ? 0 : 1);
     }
 
     public function __toString(): string
@@ -156,10 +163,16 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
             // Use centralized method for updating From address
             $this->updateEmailFields($email);
 
+            if ('auto' === ($this->settings['bulk'] ?? 'off') && $this->canIdentifyRecipients($email)) {
+                $this->sendWithBulkAdapter();
+
+                return;
+            }
+
             $failures = [];
 
             // Handle attachment or non-template emails
-            if ($email->getAttachments() || !$this->enableTemplate) {
+            {
                 $this->logger->debug('attachments OR NOT template');
                 $this->logger->debug('sendrate:' . $this->settings['maxSendRate']);
 
@@ -213,6 +226,7 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
 
                             $retryCommands = $batchFailures;
                             $batchFailures = [];
+                            $this->acquireTokens($bucketFile, count($retryCommands), $rate);
                             $retryPool = new CommandPool($this->client, $retryCommands, [
                                 'concurrency' => count($retryCommands),
                                 'fulfilled' => function (Result $result, $iteratorId) {
@@ -262,6 +276,175 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
             $this->logger->info($exception);
             throw new TransportException(sprintf('Unable to send an email: %s .', $exception->getMessage(), $exception->getCode()));
         }
+    }
+
+    private function canIdentifyRecipients(MauticMessage $message): bool
+    {
+        if (!$message->getMetadata()) {
+            return false;
+        }
+        foreach ($message->getMetadata() as $data) {
+            if (empty($data['hashId']) || !is_string($data['hashId']) || strlen($data['hashId']) > 191 || empty($data['emailId'])) {
+                $this->logger->info('SES raw sending: recipient metadata has no durable delivery identity.');
+
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function sendWithBulkAdapter(): void
+    {
+        if (!$this->deliveryStore || !$this->bulkSender) {
+            throw new \LogicException('SES bulk services are not configured.');
+        }
+        $this->deliveryStore->assertInstalled();
+        BulkSender::assertSupported($this->client);
+        $scope = BulkSender::scope($this->client);
+        $this->deliveryStore->expireClaims($scope);
+        $rate = max(1, (int) ($this->settings['maxSendRate'] ?? 14));
+        $limit = min(50, $rate, (int) ($this->settings['bulkBatchSize'] ?? 50));
+        foreach ((new BulkBatcher())->batches($this->bulkDeliveries($scope), $limit) as $batch) {
+            $ids = [];
+            foreach ($batch as $delivery) {
+                $ids[] = $this->deliveryStore->enqueue($delivery, $scope);
+            }
+            $this->bulkSender->send($this->client, $ids, fn (int $recipients) => $this->acquireRecipientQuota($recipients));
+        }
+        $this->logger->info('SES transport batch persisted and processed.', ['email_id' => $this->getEmailIdFromMetadata($this->message->getMetadata()), 'bulk' => 'auto']);
+    }
+
+    /** Retry commands and first submissions share precisely the same limiter. */
+    private function acquireRecipientQuota(int $recipients): void
+    {
+        $rate = max(1, (int) ($this->settings['maxSendRate'] ?? 14));
+        $bucket = $this->pathsHelper->getSystemPath('cache', true).'/ses_token_bucket.json';
+        while ($recipients > 0) {
+            $count = min($recipients, $rate);
+            $this->acquireTokens($bucket, $count, $rate);
+            $recipients -= $count;
+        }
+    }
+
+    /** Used by the bounded cron recovery command; never retries unknown acceptance. */
+    public function retryBulk(int $limit = 1000): int
+    {
+        if ('auto' !== ($this->settings['bulk'] ?? 'off') || !$this->deliveryStore || !$this->bulkSender) {
+            throw new \LogicException('Enable bulk=auto to process the SES outbox.');
+        }
+        $this->deliveryStore->assertInstalled();
+        BulkSender::assertSupported($this->client);
+        $scope = BulkSender::scope($this->client);
+        $this->deliveryStore->expireClaims($scope);
+        $due = $this->deliveryStore->due($scope, $limit);
+        $deliveries = (function () use ($due): \Generator {
+            foreach ($due as $row) {
+                $content = $this->deliveryStore->content($row['content_id']);
+                yield ['id' => $row['id'], 'email_id' => $row['email_id'], 'operation' => $content['operation'], 'common' => $content['payload'], 'entry' => json_decode($row['entry'], true, 512, JSON_THROW_ON_ERROR)];
+            }
+        })();
+        $count = min(50, max(1, (int) ($this->settings['maxSendRate'] ?? 14)), (int) ($this->settings['bulkBatchSize'] ?? 50));
+        foreach ((new BulkBatcher())->batches($deliveries, $count) as $batch) {
+            $this->bulkSender->send($this->client, array_column($batch, 'id'), fn (int $recipients) => $this->acquireRecipientQuota($recipients));
+        }
+
+        return count($due);
+    }
+
+    private function bulkDeliveries(string $scope): \Generator
+    {
+        $compiler = new SharedTemplateCompiler();
+        foreach ($this->message->getMetadata() as $recipient => $data) {
+            $id = hash('sha256', $scope.'|'.$data['emailId'].'|'.$data['hashId'].'|'.$recipient);
+            $reason = '';
+            try {
+                $compiled = $compiler->compile($this->message, $data['tokens'] ?? []);
+                // Only headers need local replacement. Shared bodies are not rendered/serialized here.
+                $headers = clone $this->message;
+                $headers->clearMetadata();
+                $headers->html(null)->text(null)->subject('');
+                $headers->to(new Address($recipient, $data['name'] ?? ''));
+                $tokens = $data['tokens'] ?? [];
+                ksort($tokens);
+                MailHelper::searchReplaceTokens(array_keys($tokens), $tokens, $headers);
+                $common = [];
+                $this->addSesHeaders($common, $headers, $data);
+                $tags = $common['EmailTags'] ?? [];
+                unset($common['EmailTags']);
+                $tags = $this->deliveryTag($tags, $id);
+                $entry = [
+                    'Destination' => ['ToAddresses' => $this->stringifyAddresses($headers->getTo())],
+                    'ReplacementEmailContent' => ['ReplacementTemplate' => ['ReplacementTemplateData' => $compiled['data']]],
+                    'ReplacementHeaders' => $this->bulkHeaders($headers),
+                    'ReplacementTags' => $tags,
+                ];
+                $common['DefaultContent'] = ['Template' => ['TemplateContent' => $compiled['template'], 'TemplateData' => '{}']];
+                if (BulkBatcher::bytes(BulkBatcher::request($common, [$entry])) > BulkBatcher::MAX_BYTES) {
+                    throw new IneligibleMessage('request_size');
+                }
+                $operation = 'bulk';
+            } catch (IneligibleMessage $e) {
+                $reason = $e->getMessage();
+                $common = $this->rawRecipient($recipient, $data);
+                $common['EmailTags'] = $this->deliveryTag($common['EmailTags'] ?? [], $id);
+                // Raw MIME can contain arbitrary bytes. Store the wire blob losslessly in JSON.
+                $common['Content']['Raw']['Data'] = base64_encode($common['Content']['Raw']['Data']);
+                $entry = [];
+                $operation = 'raw';
+            }
+            yield ['id' => $id, 'tracking_hash' => $data['hashId'], 'email_id' => (int) $data['emailId'], 'operation' => $operation, 'common' => $common, 'entry' => $entry, 'reason' => $reason];
+        }
+    }
+
+    private function deliveryTag(array $tags, string $id): array
+    {
+        $tags = array_values(array_filter($tags, static fn (array $tag): bool => 'mautic_delivery_id' !== ($tag['Name'] ?? '')));
+        $tags[] = ['Name' => 'mautic_delivery_id', 'Value' => $id];
+
+        return $tags;
+    }
+
+    private function bulkHeaders(MauticMessage $message): array
+    {
+        $result = [];
+        foreach ($message->getHeaders()->all() as $header) {
+            $name = $header->getName();
+            if ($header instanceof MetadataHeader || in_array(strtolower($name), ['from', 'to', 'cc', 'bcc', 'reply-to', 'subject', 'date', 'message-id', 'mime-version', 'content-type', 'content-transfer-encoding'], true)) {
+                continue;
+            }
+            if (!preg_match('/^(x-|list-)/i', $name) && !in_array(strtolower($name), ['precedence', 'feedback-id', 'auto-submitted'], true)) {
+                throw new IneligibleMessage('unsupported_header');
+            }
+            $value = $header->getBodyAsString();
+            if (strlen($name) > 126 || strlen($value) > 870 || preg_match('/[\r\n]/', $value)) {
+                throw new IneligibleMessage('header_size_or_folding');
+            }
+            $result[] = ['Name' => $name, 'Value' => $value];
+        }
+        if (count($result) > 15) {
+            throw new IneligibleMessage('header_count');
+        }
+
+        return $result;
+    }
+
+    private function rawRecipient(string $recipient, array $mailData): array
+    {
+        $sentMessage = clone $this->message;
+        $sentMessage->clearMetadata();
+        $sentMessage->updateLeadIdHash($mailData['hashId'] ?? null);
+        $sentMessage->to(new Address($recipient, $mailData['name'] ?? ''));
+        $tokens = $mailData['tokens'] ?? [];
+        ksort($tokens);
+        MailHelper::searchReplaceTokens(array_keys($tokens), $tokens, $sentMessage);
+        $this->updateEmailFields($sentMessage);
+        $payload = [];
+        $this->addSesHeaders($payload, $sentMessage, $mailData);
+        $payload['Destination'] = ['ToAddresses' => $this->stringifyAddresses($sentMessage->getTo()), 'CcAddresses' => $this->stringifyAddresses($sentMessage->getCc()), 'BccAddresses' => $this->stringifyAddresses($sentMessage->getBcc())];
+        $payload['Content'] = ['Raw' => ['Data' => $sentMessage->toString()]];
+
+        return $payload;
     }
 
     /**
