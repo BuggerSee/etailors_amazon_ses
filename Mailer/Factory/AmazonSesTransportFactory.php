@@ -111,8 +111,12 @@ class AmazonSesTransportFactory extends AbstractTransportFactory
         if (false === $size) {
             throw new InvalidArgumentException('SES bulk_batch_size must be an integer between 1 and 50.');
         }
+        $concurrency = filter_var($dsn->getOption('bulk_concurrency', 2), FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 10]]);
+        if (false === $concurrency) {
+            throw new InvalidArgumentException('SES bulk_concurrency must be an integer between 1 and 10.');
+        }
 
-        return ['bulk' => $mode, 'bulkBatchSize' => $size];
+        return ['bulk' => $mode, 'bulkBatchSize' => $size, 'bulkConcurrency' => $concurrency];
     }
 
     /**

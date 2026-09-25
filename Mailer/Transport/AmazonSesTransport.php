@@ -311,12 +311,13 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
         $this->deliveryStore->expireClaims($scope);
         $rate = max(1, (int) ($this->settings['maxSendRate'] ?? 14));
         $limit = min(50, $rate, (int) ($this->settings['bulkBatchSize'] ?? 50));
+        $concurrency = max(1, (int) ($this->settings['bulkConcurrency'] ?? 2));
         foreach ((new BulkBatcher())->batches($this->bulkDeliveries($scope), $limit) as $batch) {
             $ids = [];
             foreach ($batch as $delivery) {
                 $ids[] = $this->deliveryStore->enqueue($delivery, $scope);
             }
-            $this->bulkSender->send($this->client, $ids, fn (int $recipients) => $this->acquireRecipientQuota($recipients));
+            $this->bulkSender->send($this->client, $ids, fn (int $recipients) => $this->acquireRecipientQuota($recipients), $concurrency);
         }
         $this->logger->info('SES transport batch persisted and processed.', ['email_id' => $this->getEmailIdFromMetadata($this->message->getMetadata()), 'bulk' => 'auto']);
     }
@@ -351,8 +352,9 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
             }
         })();
         $count = min(50, max(1, (int) ($this->settings['maxSendRate'] ?? 14)), (int) ($this->settings['bulkBatchSize'] ?? 50));
+        $concurrency = max(1, (int) ($this->settings['bulkConcurrency'] ?? 2));
         foreach ((new BulkBatcher())->batches($deliveries, $count) as $batch) {
-            $this->bulkSender->send($this->client, array_column($batch, 'id'), fn (int $recipients) => $this->acquireRecipientQuota($recipients));
+            $this->bulkSender->send($this->client, array_column($batch, 'id'), fn (int $recipients) => $this->acquireRecipientQuota($recipients), $concurrency);
         }
 
         return count($due);
