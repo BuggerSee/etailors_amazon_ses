@@ -248,6 +248,11 @@ class AmazonSesTransportFactory extends AbstractTransportFactory
             throw new InvalidArgumentException($this->translator->trans('mautic.amazonses.plugin.ratelimit.invalid', [], 'validators'));
         }
 
+        $endpoint = $dsn->getOption('endpoint');
+        if (null !== $endpoint && (false === filter_var($endpoint, FILTER_VALIDATE_URL) || !in_array(strtolower((string) parse_url($endpoint, PHP_URL_SCHEME)), ['http', 'https'], true))) {
+            throw new InvalidArgumentException('SES endpoint must be an absolute http(s) URL.');
+        }
+
         if (!isset($this->amazonClients[$dsn_region])) {
             $config = [
                 'version'     => 'latest',
@@ -255,6 +260,10 @@ class AmazonSesTransportFactory extends AbstractTransportFactory
                 'region'      => $dsn_region,
                 'use_aws_shared_config_files' => false,
             ];
+
+            if (null !== $endpoint) {
+                $config['endpoint'] = $endpoint;
+            }
 
             if ($handler) {
                 $config['handler'] = $handler;
