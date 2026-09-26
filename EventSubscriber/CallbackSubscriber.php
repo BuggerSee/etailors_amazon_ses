@@ -20,6 +20,8 @@ use Mautic\LeadBundle\Entity\DoNotContact as DNC;
 use Mautic\LeadBundle\Entity\Lead;
 use Mautic\LeadBundle\Model\DoNotContact as DncModel;
 use Mautic\LeadBundle\Model\LeadModel;
+use MauticPlugin\AmazonSesBundle\Helper\MauticEmailId;
+use MauticPlugin\AmazonSesBundle\Helper\SnsWebhookAuthenticator;
 use MauticPlugin\AmazonSesBundle\Mailer\Transport\AmazonSesTransport;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
@@ -44,6 +46,7 @@ class CallbackSubscriber implements EventSubscriberInterface
         private ContactFinder $finder,
         private DncModel $dncModel,
         private LeadModel $leadModel,
+        private SnsWebhookAuthenticator $snsWebhookAuthenticator,
         TranslatorInterface $translator,
         ?LoggerInterface $logger = null,
     ) {
@@ -63,7 +66,8 @@ class CallbackSubscriber implements EventSubscriberInterface
 
     public function processCallbackRequest(TransportWebhookEvent $event): void
     {
-        $dsn = Dsn::fromString($this->coreParametersHelper->get('mailer_dsn'));
+        // Mautic stores the DSN with % escaped as %% (see MailerDsnEnvVarProcessor); undo that before parsing
+        $dsn = Dsn::fromString(str_replace('%%', '%', (string) $this->coreParametersHelper->get('mailer_dsn')));
 
         if (AmazonSesTransport::MAUTIC_AMAZONSES_API_SCHEME !== $dsn->getScheme()) {
             return;
@@ -97,20 +101,21 @@ class CallbackSubscriber implements EventSubscriberInterface
             return;
         }
 
-        $type = '';
-        if (array_key_exists('Type', $payload)) {
-            $type = $payload['Type'];
-        } elseif (array_key_exists('eventType', $payload)) {
-            $type = $payload['eventType'];
-        } elseif (array_key_exists('notificationType', $payload)) {
-            $type = $payload['notificationType'];
-        } else {
+        if (!array_key_exists('Type', $payload)) {
             $event->setResponse(
                 $this->createResponse(
                     $this->translator->trans('mautic.amazonses.plugin.sns.callback.json.invalid_payload_type', [], 'validators'),
                     false
                 )
             );
+
+            return;
+        }
+
+        $type = (string) $payload['Type'];
+        if (!$this->snsWebhookAuthenticator->authenticate($payload, $this->getAllowedSnsTopicArns($dsn))) {
+            $this->logger?->warning('Rejected unauthenticated Amazon SNS webhook.');
+            $event->setResponse(new Response('Invalid SNS notification', Response::HTTP_FORBIDDEN));
 
             return;
         }
@@ -125,6 +130,26 @@ class CallbackSubscriber implements EventSubscriberInterface
 
         $this->logger->debug('end processCallbackRequest - Amazon SNS Webhook');
         $event->setResponse($eventResponse);
+    }
+
+    /** @return list<string> */
+    private function getAllowedSnsTopicArns(Dsn $dsn): array
+    {
+        $configured = $dsn->getOption('sns_topic_arn')
+            ?? $this->coreParametersHelper->get('amazon_ses_sns_topic_arns', []);
+
+        if (is_string($configured)) {
+            $configured = preg_split('/[\r\n,]+/', $configured, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        }
+
+        if (!is_array($configured)) {
+            return [];
+        }
+
+        return array_values(array_filter(array_map(
+            static fn (mixed $topicArn): string => trim((string) $topicArn),
+            $configured,
+        )));
     }
 
     /**
@@ -207,7 +232,8 @@ class CallbackSubscriber implements EventSubscriberInterface
 
                 try {
                     $message = json_decode($payload['Message'], true, 512, JSON_THROW_ON_ERROR);
-                    $this->processJsonPayload($message, $message['notificationType']);
+                    $innerType = $message['notificationType'] ?? $message['eventType'] ?? 'unknown';
+                    $this->processJsonPayload($message, $innerType);
                 } catch (\Exception $e) {
                     $this->logger->error('AmazonCallback: Invalid Notification JSON Payload');
                     $hasError = true;
@@ -226,6 +252,7 @@ class CallbackSubscriber implements EventSubscriberInterface
                 $typeFound = true;
 
                 $emailId = $this->getEmailHeader($payload);
+                $this->logMissingEmailId('complaint', $payload, $emailId);
 
                 // Get bounced recipients in an array
                 $complaintRecipients = $payload['complaint']['complainedRecipients'];
@@ -278,9 +305,10 @@ class CallbackSubscriber implements EventSubscriberInterface
             $typeName = 'HARD';
         } elseif ('Transient' === $type) {
             $typeName = 'SOFT';
-            $channel = 'soft bounce';
+            $channel = 'soft_bounce';
         }
         $emailId = $this->getEmailHeader($payload);
+        $this->logMissingEmailId('bounce', $payload, $emailId);
         $bouncedRecipients = $payload['bounce']['bouncedRecipients'];
         foreach ($bouncedRecipients as $bouncedRecipient) {
             $bounceSubType = $payload['bounce']['bounceSubType'];
@@ -304,7 +332,7 @@ class CallbackSubscriber implements EventSubscriberInterface
         if ($contacts = $result->getContacts()) {
             foreach ($contacts as $contact) {
                 $channel = ($channel) ?: 'email';
-                if (is_array($channel) && 'soft bounce' === key($channel)) {
+                if (is_array($channel) && 'soft_bounce' === key($channel)) {
                     $this->addSoftBounceDncEntry($contact, $channel, $dncReason, $comments);
                 } else {
                     $this->dncModel->addDncForContact($contact->getId(), $channel, $dncReason, $comments);
@@ -318,8 +346,8 @@ class CallbackSubscriber implements EventSubscriberInterface
         $dncEntities       = $contact->getDoNotContact();
         $softBounceUpdated = false;
         foreach ($dncEntities as $dnc) {
-            if ('soft bounce' === $dnc->getChannel()) {
-                $this->dncModel->updateDncRecord($dnc, $contact, 'soft bounce', $dncReason, $comments);
+            if ('soft_bounce' === $dnc->getChannel()) {
+                $this->dncModel->updateDncRecord($dnc, $contact, 'soft_bounce', $dncReason, $comments);
                 $this->leadModel->saveEntity($contact);
                 $softBounceUpdated = true;
                 break;
@@ -390,16 +418,26 @@ class CallbackSubscriber implements EventSubscriberInterface
         return preg_replace('/(.*)<(.*)>(.*)/s', '\2', $email);
     }
 
-    public function getEmailHeader($payload)
+    public function getEmailHeader(array $payload): ?int
     {
-        if (!isset($payload['mail']['headers'])) {
-            return null;
+        return MauticEmailId::fromSesNotification($payload);
+    }
+
+    /**
+     * @param array<string, mixed> $payload
+     */
+    private function logMissingEmailId(string $notificationType, array $payload, ?int $emailId): void
+    {
+        if (null !== $emailId) {
+            return;
         }
 
-        foreach ($payload['mail']['headers'] as $header) {
-            if ('X-EMAIL-ID' === strtoupper($header['name'])) {
-                return $header['value'];
-            }
-        }
+        $this->logger?->warning(
+            'SES {notification_type} notification has no valid Mautic email ID; the contact will be updated, but per-email statistics cannot be attributed.',
+            [
+                'notification_type' => $notificationType,
+                'ses_message_id'    => $payload['mail']['messageId'] ?? null,
+            ]
+        );
     }
 }

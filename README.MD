@@ -73,12 +73,15 @@ php bin/console mautic:plugins:reload
 3. In the **DSN** field, enter your connection string in the following format:
 
    ```text
-   mautic+ses+api://<AWS_ACCESS_KEY>:<AWS_SECRET_KEY>@default?region=<AWS_REGION>&ratelimit=14
+   mautic+ses+api://<AWS_ACCESS_KEY>:<AWS_SECRET_KEY>@default?region=<AWS_REGION>&ratelimit=14&sns_topic_arn=<SNS_TOPIC_ARN>
    ```
 
    - Replace `<AWS_ACCESS_KEY>` and `<AWS_SECRET_KEY>` with your AWS credentials.
    - Replace `<AWS_REGION>` with your AWS region (e.g., `us-east-1`).
    - Optionally set `ratelimit` to override the SES max send rate manually.
+   - Set `sns_topic_arn` to the exact SNS topic ARN used for feedback. The callback
+     fails closed when no allowed topic is configured. For multiple topics, set
+     `amazon_ses_sns_topic_arns` as an array in Mautic's local configuration.
 
 4. Set the region in the `options` parameter, for example:
 
@@ -105,21 +108,17 @@ Your IAM user must have permission to send and get account limits. Here’s an e
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "AllowSending",
+      "Sid": "AllowSesSendingAndQuota",
       "Effect": "Allow",
       "Action": [
         "ses:SendEmail",
-        "ses:SendBulkEmail"
+        "ses:SendRawEmail",
+        "ses:GetSendQuota"
       ],
-      "Resource": "arn:aws:ses:*:<account id>:identity/*"
-    },
-    {
-      "Sid": "AllowGetAccount",
-      "Effect": "Allow",
-      "Action": [
-        "ses:GetAccount"
-      ],
-      "Resource": "*"
+      "Resource": [
+        "arn:aws:ses:<region>:<account id>:identity/*",
+        "arn:aws:ses:<region>:<account id>:configuration-set/*"
+      ]
     }
   ]
 }
@@ -165,7 +164,10 @@ To receive feedback from Amazon SES regarding bounces and complaints, you need t
    ```
 
 4. Ensure your topic sends notifications for bounces, complaints, and delivery status.
-5. Test your callback configuration by sending test emails and reviewing Mautic logs to verify feedback is processed correctly.
+5. Ensure the exact topic ARN is configured as `sns_topic_arn` in the mailer DSN.
+   The plugin verifies the AWS signature and topic before processing any callback.
+6. For classic identity-based SNS notifications, enable **Include original headers** for bounce and complaint notifications on the verified SES identity. Mautic uses the `X-EMAIL-ID` header to attribute feedback to the email statistics. Configuration-set event publishing can use the `X-EMAIL-ID` message tag added by this plugin instead.
+7. Test your callback configuration by sending test emails and reviewing Mautic logs to verify feedback is processed correctly.
 
 ---
 

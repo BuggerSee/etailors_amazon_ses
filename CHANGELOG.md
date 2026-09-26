@@ -4,6 +4,59 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [1.0.41] - 2026-09-25
+- `CallbackSubscriber` now unescapes Mautic's `%%` in `mailer_dsn` before parsing it, so an `sns_topic_arn` DSN option saved through the Email settings UI (stored as `arn%%3Aaws%%3A...`) matches the SNS `TopicArn` instead of decoding to `arn%:aws%:...` and rejecting every callback with 403.
+
+## [1.0.40] - 2026-09-21
+### Security
+- Authenticate SNS webhook signatures with AWS's maintained validator and require an exact allowed topic ARN before processing feedback.
+
+## [1.0.39] - 2026-09-07
+### Fixed
+- Merged Fix per-email bounce attribution when SES omits headers- #154
+  https://github.com/pm-pmaas/etailors_amazon_ses/pull/154.
+
+## [1.0.38] - 2026-08-31
+### Fixed
+- Fixed the release branch metadata so the plugin reports version `1.0.38`.
+
+## [1.0.37] - 2026-07-24
+### Fixed
+- Changed DNC channel value from `soft bounce` to `soft_bounce` to fix `RouteNotFoundException` in Mautic reports. **Note: requires manual SQL migration: `UPDATE lead_donotcontact SET channel = 'soft_bounce' WHERE channel = 'soft bounce';`**
+- Fixed SES rate limit token bucket cache permission errors by returning a clear transport error instead of crashing with a `flock()` `TypeError` when the Mautic cache directory is not writable.
+
+## [1.0.36] - 2026-06-10
+### Fixed
+- Fixed missing `eventType` fallback in `CallbackSubscriber.php` for the `Notification` case: added null-coalescing fallback `$message['notificationType'] ?? $message['eventType'] ?? 'unknown'` to handle SNS notifications that use `eventType` instead of `notificationType`.
+
+## [1.0.35] - 2026-05-21
+### Fixed
+- Fixed multi-region SES support: `AmazonSesTransportFactory` now caches `SesV2Client` instances per region instead of a single shared client, preventing the first configured region from being silently reused for all subsequent transports with different regions.
+
+## [1.0.34] - 2026-05-21
+### Fixed
+- Re-released fix from 1.0.33 branch that was missing from the 1.0.33 tag: mailer DSN not being recognized in worker/messenger context due to static properties in `AmazonSesTransportFactory`.
+
+## [1.0.33] - 2026-05-21
+### Fixed
+- Fixed mailer DSN not being recognized in worker/messenger context by converting static properties and methods in `AmazonSesTransportFactory` to instance-based, ensuring each process gets its own properly initialized factory.
+- Fixed cache permission errors by moving the SES send quota cache file from the `cache` directory to the `tmp` directory.
+- Removed unused `$amazonclient` constructor parameter from `AmazonSesTransportFactory`.
+
+## [1.0.32] - 2026-04-22
+### Added
+- Shared file-based token bucket for cross-worker SES rate coordination.
+- New DSN option `batchmultiplier` (default 10) to control contacts per queue message.
+- Inline retry with exponential backoff (1s, 2s, 4s) within `doSend()`, replacing Symfony Messenger retry to prevent metadata loss.
+### Changed
+- Improved throughput pacing by sending emails in micro-batches (ceil(rate/10)) via `CommandPool`.
+- Moved rate limiting to sit between actual SES API calls rather than payload building.
+- Updated `getMaxBatchLimit()` to return `rate` × `batchmultiplier`.
+### Fixed
+- Fixed `processFailures()` throwing an exception which caused Symfony Messenger to retry entire batches and result in duplicate sends.
+- Fixed `throttle()` positioning to ensure effective rate limiting.
+- Prevented throughput spikes above SES limit when using multiple workers by implementing shared rate limiting.
+
 ## [1.0.31] - 2026-01-24
 ### Added
 - Mautic 7 compatibility.
