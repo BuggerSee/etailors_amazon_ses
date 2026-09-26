@@ -5,10 +5,15 @@ declare(strict_types=1);
 /*
  * Seed a local Mautic with an e2e segment and newsletter through Mautic's own models (no HTTP or API credentials needed).
  *
- * Usage: [STATE_FILE=...] [SEED_HTML_FILE=...] [SEED_NAME=...] [SEED_SUBJECT=...] php -d memory_limit=1G seed.php <mautic-root> [count] [domain]
+ * Usage: [STATE_FILE=...] [SEED_ADDRESSES=a@x,b@y] [SEED_FROM=...] [SEED_HTML_FILE=...] [SEED_NAME=...] [SEED_SUBJECT=...]
+ *        php -d memory_limit=1G seed.php <mautic-root> [count] [domain]
  *
  * Creates <count> ordinary contacts plus transient@, throttled@, rejected@ and flaky@<stamp>.<domain>, a segment holding
  * them and a published segment email, then writes the ids to STATE_FILE (default: <system temp dir>/ses-e2e-state.json).
+ * SEED_ADDRESSES (comma-separated) replaces the generated contacts and ignores count and domain: a contact that already
+ * exists for an address is reused, without its email do-not-contact entries, the others are created. The segment and the
+ * email are new on every run, so every seeded contact is pending. SEED_FROM sets the email's From address
+ * (default: sender@example.test); a live run needs an identity SES has verified.
  */
 
 use Mautic\EmailBundle\Entity\Email;
@@ -31,27 +36,58 @@ $container = $kernel->getContainer();
 $leadModel = $container->get('mautic.lead.model.lead');
 $listModel = $container->get('mautic.lead.model.list');
 $emailModel = $container->get('mautic.email.model.email');
+$dncModel = $container->get('mautic.lead.model.dnc');
 
-// 1. Contacts: N ordinary recipients plus the fake-SES failure-injection local parts.
+// 1. Contacts: the SEED_ADDRESSES, or N ordinary recipients plus the fake-SES failure-injection local parts.
 $emails = [];
-for ($i = 1; $i <= $count; ++$i) {
-    $emails[] = sprintf('success%03d.%s@%s', $i, $stamp, $domain);
-}
-// The fake SES server matches these local parts exactly, so the run stamp goes into the domain.
-foreach (['transient', 'throttled', 'rejected', 'flaky'] as $local) {
-    $emails[] = sprintf('%s@%s.%s', $local, $stamp, $domain);
+$given = (string) getenv('SEED_ADDRESSES');
+if ('' !== $given) {
+    foreach (array_filter(array_map('trim', explode(',', $given)), 'strlen') as $address) {
+        if (false === filter_var($address, FILTER_VALIDATE_EMAIL)) {
+            fwrite(STDERR, "SEED_ADDRESSES: not an email address: $address\n");
+            exit(2);
+        }
+        $emails[strtolower($address)] ??= $address;
+    }
+    $emails = array_values($emails);
+    if ([] === $emails) {
+        fwrite(STDERR, "SEED_ADDRESSES holds no address\n");
+        exit(2);
+    }
+} else {
+    for ($i = 1; $i <= $count; ++$i) {
+        $emails[] = sprintf('success%03d.%s@%s', $i, $stamp, $domain);
+    }
+    // The fake SES server matches these local parts exactly, so the run stamp goes into the domain.
+    foreach (['transient', 'throttled', 'rejected', 'flaky'] as $local) {
+        $emails[] = sprintf('%s@%s.%s', $local, $stamp, $domain);
+    }
 }
 $leads = [];
+$created = [];
 foreach ($emails as $address) {
-    $lead = new Lead();
-    $lead->setEmail($address);
-    $lead->setFirstname('E2E');
-    $lead->setLastname(strstr($address, '@', true));
+    // Generated addresses carry the run stamp and are always new; given addresses keep their contact across runs.
+    $existing = '' !== $given ? $leadModel->getRepository()->getLeadByEmail($address) : null;
+    if (null !== $existing) {
+        $lead = $leadModel->getEntity((int) $existing['id']);
+        // Mautic skips contacts that are do-not-contact for email, such as bounce@ and complaint@ after an earlier live run.
+        while ($dncModel->removeDncForContact($lead->getId(), 'email')) {
+            printf("removed an email do-not-contact entry of %s\n", $address);
+        }
+    } else {
+        $lead = new Lead();
+        $lead->setEmail($address);
+        $lead->setFirstname('E2E');
+        $lead->setLastname(strstr($address, '@', true));
+        $created[] = $lead;
+    }
     $leads[] = $lead;
 }
-$leadModel->saveEntities($leads);
+if ([] !== $created) {
+    $leadModel->saveEntities($created);
+}
 $contactIds = array_map(static fn (Lead $lead): int => (int) $lead->getId(), $leads);
-printf("created %d contacts\n", count($contactIds));
+printf("created %d contacts, reused %d\n", count($created), count($leads) - count($created));
 
 // 2. Segment with manual membership, so the run is deterministic.
 $list = new LeadList();
@@ -107,7 +143,7 @@ $email->setPublishUp(new \DateTime('-1 minute', new \DateTimeZone('UTC')));
 if (method_exists($email, 'setContinueSending')) {
     $email->setContinueSending(true);
 }
-$email->setFromAddress('sender@example.test');
+$email->setFromAddress(getenv('SEED_FROM') ?: 'sender@example.test');
 $email->setFromName('E2E Sender');
 try {
     $emailModel->saveEntity($email);

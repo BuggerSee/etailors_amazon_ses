@@ -204,7 +204,10 @@ column stays empty and the callback is not exercised.
 
 ## Tier 2: SES sandbox
 
-The sandbox limits you to verified recipients and the mailbox simulator, which is enough here.
+The sandbox limits you to verified recipients and the mailbox simulator, which is enough here. Mails to the mailbox
+simulator are billed like any other, but they do not count against your sending quota and do not affect your
+reputation (bounce and complaint rates). Steps 1 to 4 prepare AWS and Mautic; the offline harness's live mode scripts
+steps 5 to 8 (see below step 4), and those steps are its manual equivalent.
 
 1. In the SES console of the region you test, verify a sender identity (a domain or an address). The IAM user needs
    the permissions from the README's [AWS SES Configuration](../README.MD#3-aws-ses-configuration) plus
@@ -213,12 +216,18 @@ The sandbox limits you to verified recipients and the mailbox simulator, which i
    event types `Send`, `Delivery`, `Bounce`, `Complaint`, `Reject` and `Rendering Failure` (`SEND`, `DELIVERY`,
    `BOUNCE`, `COMPLAINT`, `REJECT` and `RENDERING_FAILURE` in the API). Make it the default configuration set of the
    sender identity, or add the custom header `X-SES-CONFIGURATION-SET` with its name to the test email
-   (**Advanced > Custom headers**).
+   (**Advanced > Custom headers**). The harness needs the default configuration set, because the email it seeds
+   carries no custom headers.
 3. Set the mailer DSN with your credentials, `bulk=auto`, the topic ARN and no `endpoint`, then clear the cache:
 
    ```text
    mautic+ses+api://<AWS_ACCESS_KEY>:<AWS_SECRET_KEY>@default?region=<AWS_REGION>&bulk=auto&sns_topic_arn=<SNS_TOPIC_ARN>
    ```
+
+   In a DSN written by hand, URL-encode the access key and the secret: a secret access key can contain `/` and `+`,
+   which become `%2F` and `%2B`. The Email Settings form encodes its user and password fields itself. In
+   `config/local.php`, double every `%` as in Tier 1, step 2. `sns_topic_arn` is the exact ARN of the topic from
+   step 2: the callback refuses notifications from any other topic.
 
    Each request carries at most as many recipients as the effective send rate (`ratelimit`, or the account's
    `MaxSendRate`). A sandbox account may send 1 message per second, so each request then carries one recipient.
@@ -240,6 +249,39 @@ The sandbox limits you to verified recipients and the mailbox simulator, which i
 
    The plugin confirms the subscription itself, but only after `sns_topic_arn` is configured, because it checks the
    topic of every callback first. The subscription then shows as confirmed in the SNS console.
+
+The offline harness scripts steps 5 to 8 with `LIVE=1` (details in its
+[README](../Tests/E2E/offline/README.md#live-mode-ses-sandbox)). `LIVE=1` refuses the actions that need the fake
+server, never changes `mailer_dsn`, and makes `verify` check the outbox and Mautic's tables instead of a fake request
+log. From the plugin checkout, with `SEED_FROM` set to an address of the verified sender identity:
+
+```bash
+export MAUTIC_ROOT=/path/to/mautic PHP_BIN=php STATE=/tmp/ses-live-state.json SEED_FROM=sender@your-verified.example
+LIVE=1 Tests/E2E/offline/run.sh seed-live you@verified.example
+LIVE=1 Tests/E2E/offline/run.sh send
+LIVE=1 Tests/E2E/offline/run.sh status
+LIVE=1 Tests/E2E/offline/run.sh verify --live
+# wait for SNS: repeat status until the SES event column is filled for every recipient
+LIVE=1 Tests/E2E/offline/run.sh verify --live --after-events
+LIVE=1 Tests/E2E/offline/run.sh sync
+```
+
+`seed-live` creates contacts for the five simulator addresses of step 5 and the addresses given (or reuses the ones
+from an earlier run and removes their email Do Not Contact entries, so that Mautic sends to them again), a new segment
+and a segment email with the harness's newsletter fixture, which carries tracked links and `{unsubscribe_url}`.
+`verify --live` prints each recipient's outbox operation, state, SES event, reason, message ID and Do Not Contact
+entries, exits non-zero when a check fails, and checks:
+
+| Check                                                                   | What it proves                                                                  |
+|-------------------------------------------------------------------------|---------------------------------------------------------------------------------|
+| One outbox row and one `email_stats` row per seeded recipient           | Every recipient was persisted before submission, and Mautic counts it as sent.  |
+| Every recipient submitted through `bulk` (`raw` with `--live-raw`)      | No recipient fell back to raw sending.                                          |
+| Every recipient `accepted` with an SES message ID                       | SES accepted every recipient with these credentials, IAM policy, sender identity and inline template. |
+| `--after-events`: the `SES event` and Do Not Contact entry from the table in step 5 for each simulator address | SES rendered and delivered, bounced or reported the complaint, and each event came back through the configuration set, SNS and the callback to the right outbox row and contact. |
+| `--after-events`: `sent` or `delivered` for every other address         | The real mailbox got at least the `Send` event and no bounce, rejection or rendering failure. |
+
+`sync` then marks `bounce@` and `suppressionlist@` failed, as in step 8. Step 9 stays manual.
+
 5. Create contacts for the mailbox simulator, and one verified address whose mailbox you can read:
 
    | Recipient                                 | SES behaviour                                        | Expected `SES event` | Mautic                                                             |

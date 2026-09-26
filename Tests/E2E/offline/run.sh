@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # Offline end-to-end run of the SES bulk adapter: a local Mautic with this plugin sends through the fake SES server
-# (Tests/E2E/fake-ses-server.php) instead of AWS. See README.md next to this script.
+# (Tests/E2E/fake-ses-server.php) instead of AWS. With LIVE=1 it drives a run against real SES (the sandbox with its
+# mailbox simulator) through the mailer_dsn already configured. See README.md next to this script.
 #
-#   run.sh prepare | fake-up | fake-down | seed [count] [domain] | send | status | retry [--now] | sync
-#          | verify [--after-retry] [--after-sync] | all [count] [domain] | async | all-async [count] [domain]
+#   run.sh prepare | fake-up | fake-down | seed [count] [domain] | seed-live [address...] | send | status | retry [--now]
+#          | sync | verify [--after-retry] [--after-sync] | verify --live [--live-raw] [--after-events]
+#          | all [count] [domain] | async | all-async [count] [domain]
 #
 # Environment:
+#   LIVE           1 for a run against real SES: fake-up, fake-down, seed, all and all-async refuse, verify always gets
+#                  --live, and seed-live needs SEED_FROM, a sender address SES has verified (default: 0)
 #   PHP_BIN        PHP binary for Mautic and the fake server (default: php)
 #   MAUTIC_ROOT    Mautic project root with bin/console, config/local.php and docroot/ (required except for fake-up/fake-down)
 #   PLUGIN_ROOT    checkout of this plugin that provides Tests/E2E/fake-ses-server.php (default: the checkout containing this script)
@@ -30,6 +34,10 @@ FAKE_PID="$WORK_DIR/fake-ses-$FAKE_PORT.pid"
 STATE="${STATE:-$WORK_DIR/ses-e2e-state.json}"
 BATCH="${BATCH:-100}"
 WORKERS="${WORKERS:-2}"
+LIVE="${LIVE:-0}"
+case "$LIVE" in 0|1) ;; *) echo "LIVE must be 0 or 1, not $LIVE" >&2; exit 2 ;; esac
+# The SES mailbox simulator addresses seed-live always seeds; verify --live --after-events knows their outcomes.
+SIMULATOR="success@simulator.amazonses.com,bounce@simulator.amazonses.com,complaint@simulator.amazonses.com,ooto@simulator.amazonses.com,suppressionlist@simulator.amazonses.com"
 
 php() { "$PHP_BIN" -d memory_limit=1G -d max_execution_time=0 "$@"; }
 console() { (cd "$MAUTIC_ROOT" && php bin/console "$@"); }
@@ -133,20 +141,42 @@ async() (
 )
 
 run() {
-  local action="${1:-all}" id
+  local action="${1:-all}" id addresses address
+  if [ "$LIVE" = 1 ]; then
+    case "$action" in
+      fake-up|fake-down|seed|all|all-async)
+        echo "LIVE=1: $action is for the fake SES server and is not run against real SES; use seed-live, send, status, verify, retry and sync" >&2
+        return 2 ;;
+    esac
+  fi
   case "$action" in
-    prepare|seed|send|status|retry|sync|verify|all|async|all-async) : "${MAUTIC_ROOT:?set MAUTIC_ROOT to the Mautic project root}" ;;
+    prepare|seed|seed-live|send|status|retry|sync|verify|all|async|all-async) : "${MAUTIC_ROOT:?set MAUTIC_ROOT to the Mautic project root}" ;;
   esac
   case "$action" in
     fake-up)   fake_up ;;
     fake-down) fake_down ;;
     prepare)   console cache:clear; console mautic:plugins:reload; console mautic:ses:bulk install ;;
     seed)      STATE_FILE="$STATE" php "$HERE/seed.php" "$MAUTIC_ROOT" "${2:-100}" "${3:-example.test}" ;;
+    seed-live)
+      shift
+      if [ "$LIVE" = 1 ] && [ -z "${SEED_FROM:-}" ]; then
+        echo "LIVE=1: set SEED_FROM to a sender address SES has verified; SES rejects every other From address" >&2
+        return 2
+      fi
+      addresses="$SIMULATOR"
+      for address in "$@"; do addresses="$addresses,$address"; done
+      SEED_ADDRESSES="$addresses" STATE_FILE="$STATE" php "$HERE/seed.php" "$MAUTIC_ROOT"
+      ;;
     send)      id="$(email_id)"; console mautic:broadcasts:send --channel=email --id="$id" --limit=100000 --batch="$BATCH" --bypass-locking ;;
     status)    id="$(email_id)"; console mautic:ses:bulk status --email-id="$id" ;;
     retry)     retry "${2:-}" ;;
     sync)      console mautic:ses:bulk sync-stats ;;
-    verify)    shift; BATCH="$BATCH" FAKE_SES_RATE="${FAKE_SES_RATE:-80}" php "$HERE/verify.php" "$MAUTIC_ROOT" "$STATE" "$FAKE_LOG" "$@" ;;
+    verify)
+      shift
+      # A live run has no fake log; verify.php does not read it with --live.
+      if [ "$LIVE" = 1 ]; then set -- --live "$@"; fi
+      BATCH="$BATCH" FAKE_SES_RATE="${FAKE_SES_RATE:-80}" php "$HERE/verify.php" "$MAUTIC_ROOT" "$STATE" "$FAKE_LOG" "$@"
+      ;;
     async)     async ;;
     all)
       run prepare

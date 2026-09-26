@@ -2,13 +2,14 @@
 
 These scripts drive a real local Mautic with this plugin against the fake SES server in `Tests/E2E/`. They do not
 need AWS: seed contacts and a segment email, send the broadcast, run the outbox retry and statistics sync, and check
-every step against the fake server's request log, the outbox tables and Mautic's statistics.
+every step against the fake server's request log, the outbox tables and Mautic's statistics. With `LIVE=1` the same
+runner sends through real SES to the mailbox simulator instead (see [Live mode: SES sandbox](#live-mode-ses-sandbox)).
 
 | File        | Purpose                                                                                                     |
 |-------------|-------------------------------------------------------------------------------------------------------------|
-| `run.sh`    | Runner: fake server, seeding, sending (inline or through Messenger workers), `mautic:ses:bulk` commands, verification. |
-| `seed.php`  | Creates contacts, a segment and a published segment email through Mautic's own models (no HTTP, no API).    |
-| `verify.php`| Cross-checks the fake SES log, `ses_bulk_deliveries`/`ses_bulk_contents` and `email_stats`; exits non-zero on any failed check. |
+| `run.sh`    | Runner: fake server, seeding, sending (inline or through Messenger workers), `mautic:ses:bulk` commands, verification; `LIVE=1` for real SES. |
+| `seed.php`  | Creates (or, for `SEED_ADDRESSES`, reuses) contacts, a segment and a published segment email through Mautic's own models (no HTTP, no API). |
+| `verify.php`| Cross-checks the fake SES log, `ses_bulk_deliveries`/`ses_bulk_contents` and `email_stats`; with `--live`, the outbox, `email_stats` and Do Not Contact entries only. Exits non-zero on any failed check. |
 | `bench.sh`  | Times `bulk=auto` against `bulk=off` for the same seed and appends the numbers to `bench-results.tsv`.      |
 
 ## Prerequisites
@@ -92,9 +93,14 @@ The port in `endpoint` must equal `FAKE_PORT`. Clear the cache after every DSN c
 | `STATE`         | `ses-e2e-state.json` next to `FAKE_LOG`                   | Seed state (`stamp`, `segment_id`, `email_id`, `contact_ids`, `emails`).        |
 | `BATCH`         | `100` (`500` in `bench.sh`)                               | Contacts per `mautic:broadcasts:send` batch; `verify` uses it to count the expected requests. |
 | `WORKERS`       | `2`                                                       | `messenger:consume email` processes that `async` runs in parallel.              |
+| `LIVE`          | `0`                                                       | `1` for a run against real SES: see [Live mode](#live-mode-ses-sandbox).        |
 
 `seed.php` also reads `SEED_HTML_FILE` (send your own HTML instead of the built-in fixture; its plain text is derived
-by stripping tags), `SEED_NAME` and `SEED_SUBJECT`.
+by stripping tags), `SEED_NAME`, `SEED_SUBJECT`, `SEED_FROM` (the email's From address, default `sender@example.test`)
+and `SEED_ADDRESSES`: a comma-separated list of addresses that replaces the generated contacts (`count` and `domain`
+are then ignored). A contact that already exists for one of these addresses is reused instead of duplicated, and its
+email Do Not Contact entries are removed, so that Mautic sends to it again; the segment and the email are new on every
+run. `seed-live` sets `SEED_ADDRESSES` itself.
 
 When you test more than one Mautic install, give each its own `FAKE_PORT`, `FAKE_LOG` and `STATE`, for example:
 
@@ -124,7 +130,8 @@ Tests/E2E/offline/run.sh all 100
 | `sync`, `verify --after-retry --after-sync` | `mautic:ses:bulk sync-stats`, then checks the failed statistics too.                          |
 
 `fake-down` stops the fake server (also the one `bench.sh` starts). Each step can be run on its own, for example
-`run.sh seed 20`, `run.sh send`, `run.sh verify`.
+`run.sh seed 20`, `run.sh send`, `run.sh verify`. `seed-live [address...]` seeds the five mailbox simulator addresses
+plus the addresses given; against the fake server they all get `SUCCESS`.
 
 `all-async [count] [domain]` runs the same steps, with `async` in place of `send`, `status` and `verify`:
 
@@ -200,7 +207,8 @@ and it reconciles failed statistics as `sync-stats` does.
 
 `verify.php <mautic-root> <state.json> <fake-ses-log.jsonl> [--after-retry] [--after-sync]` reads the database
 credentials from `<mautic-root>/config/local.php`, keeps only the logged requests whose `X-EMAIL-ID` tag is the seeded
-email, prints `PASS`/`FAIL` per check and exits 1 when any check fails (2 on bad arguments).
+email, prints `PASS`/`FAIL` per check and exits 1 when any check fails (2 on bad arguments). The checks of a live run
+(`--live`) are described under [Live mode](#live-mode-ses-sandbox).
 
 | Check                                                                      | What it proves                                                                  |
 |----------------------------------------------------------------------------|---------------------------------------------------------------------------------|
@@ -235,15 +243,97 @@ Expected outbox states per stage:
 ## What the harness cannot prove
 
 - SES-side rendering. The fake server does not render templates; the verifier's own `{{var}}` substitution mirrors
-  simple replacement only. Use the SES sandbox with the mailbox simulator to confirm what recipients receive.
+  simple replacement only. Use the SES sandbox with the mailbox simulator to confirm what recipients receive
+  ([live mode](#live-mode-ses-sandbox)).
 - Real events. No `Send`, `Delivery`, `Bounce`, `Complaint`, `Reject` or `Rendering Failure` notifications arrive,
-  so the `event` column stays empty and the SNS callback path is not exercised.
+  so the `event` column stays empty and the SNS callback path is not exercised. Live mode covers them.
 - SES limits and behaviour: request size limits, quotas, real throttling, account-level suppression, credentials,
   IAM policies and regions.
 - Raw sending beyond counting: raw requests are only counted, their MIME content is not checked.
 - Queued sending beyond one host and one transport: `async` covers the Doctrine transport with workers on one
   machine. Other transports (AMQP, Redis), workers on several hosts (each host has its own token-bucket file) and
   Messenger's failure transport are not exercised, nor is a worker that dies during a request (its rows turn `unknown`).
+
+## Live mode: SES sandbox
+
+`LIVE=1` drives the [Tier 2 run](../../../docs/SES_E2E_TESTING.md#tier-2-ses-sandbox) against real SES: the mailbox
+simulator (`success@`, `bounce@`, `complaint@`, `ooto@` and `suppressionlist@simulator.amazonses.com`) plus verified
+addresses whose mailbox you can read. A live run has no request log, so `verify` checks the outbox, `email_stats` and
+the Do Not Contact entries only, and, once SNS has delivered them, the SES events. Mails to the mailbox simulator are
+billed like any other, but they do not count against your sending quota and do not affect your reputation (bounce and
+complaint rates).
+
+Under `LIVE=1`, `fake-up`, `fake-down`, `seed`, `all` and `all-async` refuse to run, `verify` always gets `--live`, and
+`seed-live` refuses to run without `SEED_FROM`. `prepare`, `send`, `status`, `retry`, `sync` and `async` work as
+offline. `run.sh` never changes `mailer_dsn`, in either mode: an offline run sends wherever the DSN points, so point it
+back at the fake server before the next offline run.
+
+### Prerequisites
+
+- In the SES region you test, a verified sender identity (a domain or an address) and, while the account is in the
+  sandbox, verified recipients (the simulator addresses need no verification). The IAM user needs the permissions in
+  the plugin's [AWS SES Configuration](../../../README.MD#3-aws-ses-configuration) plus `ses:SendBulkEmail`.
+- An SNS topic, and an SES configuration set with an SNS event destination that publishes `Send`, `Delivery`,
+  `Bounce`, `Complaint`, `Reject` and `Rendering Failure` to it. Make it the default configuration set of the sender
+  identity: the seeded email carries no `X-SES-CONFIGURATION-SET` header. Without it, no events arrive.
+- The topic subscribed with the HTTPS protocol to `https://<host>/mailer/callback` of this Mautic, through a tunnel
+  such as `cloudflared tunnel --url http://localhost:8080` for a local install (Tier 2, step 4).
+- The mailer DSN with real credentials, set by you (**Settings > Configuration > Email Settings** or
+  `config/local.php`), then `run.sh prepare` to clear the cache:
+
+  ```
+  mautic+ses+api://<AWS_ACCESS_KEY>:<AWS_SECRET_KEY>@default?region=<AWS_REGION>&bulk=auto&sns_topic_arn=<SNS_TOPIC_ARN>
+  ```
+
+  - Access key and secret URL-encoded: a secret access key can contain `/` and `+`, which become `%2F` and `%2B`
+    (`php -r 'echo rawurlencode($argv[1]), "\n";' '<secret>'`). The Email Settings form encodes its user and password
+    fields itself. In `config/local.php`, double every `%` as for the fake DSN above.
+  - `sns_topic_arn`, the exact ARN of that topic: the callback refuses notifications from other topics and confirms
+    the subscription only once the ARN is configured.
+  - `bulk=auto` and no `endpoint`. Without `ratelimit` the plugin uses the account's `MaxSendRate`, which is 1 per
+    second in a new sandbox account, so each request then carries one recipient.
+- `SEED_FROM` set to an address of the verified sender identity. SES rejects every other From address.
+
+### Running
+
+```
+export MAUTIC_ROOT=/path/to/mautic PHP_BIN=php STATE=/tmp/ses-live-state.json SEED_FROM=sender@your-verified.example
+LIVE=1 Tests/E2E/offline/run.sh seed-live you@verified.example
+LIVE=1 Tests/E2E/offline/run.sh send
+LIVE=1 Tests/E2E/offline/run.sh status
+LIVE=1 Tests/E2E/offline/run.sh verify --live
+# wait for SNS: repeat status until the SES event column is filled for every recipient
+LIVE=1 Tests/E2E/offline/run.sh verify --live --after-events
+LIVE=1 Tests/E2E/offline/run.sh sync
+```
+
+`seed-live` seeds the five simulator addresses plus every address given (here `you@verified.example`), a new segment
+and a new email. Each run reuses the contacts of earlier runs and removes their email Do Not Contact entries, such as
+the ones the previous run's `bounce@`, `suppressionlist@` and `complaint@` left behind, because Mautic does not send to
+do-not-contact contacts. When SES throttled some recipients (rows in `retry`, see Tier 2, step 3), run
+`LIVE=1 run.sh retry --now` before `verify --live`. `sync` then marks the bounced recipients (`bounce@` and
+`suppressionlist@`) failed in `email_stats`.
+
+`verify --live` prints one line per recipient with the outbox operation, state, SES event, reason, SES message ID and
+Do Not Contact entries (`bounced`, `unsubscribed`, `manual`; other channels than email are prefixed, as in
+`soft_bounce:bounced`), then its checks:
+
+| Check                                                              | What it proves                                                              |
+|--------------------------------------------------------------------|-----------------------------------------------------------------------------|
+| one outbox row per seeded recipient                                | Every recipient was persisted before submission.                            |
+| every recipient was submitted through bulk                         | No recipient fell back to raw sending; with `--live-raw`, every one did.    |
+| every recipient is accepted with an SES message id                 | SES accepted every recipient with these credentials, IAM policy, sender identity and inline template, and the outbox stored the message ID SES returned for each. |
+| Mautic recorded one email_stats row per recipient                  | Mautic counts every recipient as sent.                                      |
+| `success@` and `ooto@` have SES event `delivered` (`--after-events`) | SES rendered and delivered the message, and the `Delivery` event came back through the configuration set, SNS and the callback to the recipient's outbox row (by its `mautic_delivery_id` tag). |
+| `bounce@` and `suppressionlist@` have SES event `bounced` and a Do Not Contact entry with reason bounced (`--after-events`) | Hard bounces reach the outbox and make the contact do-not-contact (reason 2) for email. |
+| `complaint@` has SES event `complained` and a Do Not Contact entry with reason unsubscribed (`--after-events`) | The complaint outranks the `Delivery` event SES also sends for it, and makes the contact unsubscribed (reason 1). |
+| every other address has SES event `sent` or `delivered` (`--after-events`) | The real mailbox got at least the `Send` event and no bounce, rejection or rendering failure. Read the message itself to judge how SES rendered it. |
+
+A simulator address with a `+label` (for example `bounce+2@simulator.amazonses.com`) is judged by the part before the
+`+`. `--live-raw` covers recipients that fell back to raw one by one while `bulk=auto`; they keep an outbox row with
+operation `raw`. An email that falls back as a whole (see the plugin README's
+[When raw sending is used instead](../../../README.MD#when-raw-sending-is-used-instead)) or a `bulk=off` send takes the
+unchanged raw path, which writes no outbox rows, so `verify --live` fails on it at the first check.
 
 ## Benchmark
 

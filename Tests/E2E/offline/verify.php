@@ -7,10 +7,16 @@ declare(strict_types=1);
  * tables and Mautic's email statistics for every seeded recipient.
  *
  * Usage: php verify.php <mautic-root> <state.json> <fake-ses-log.jsonl> [--after-retry] [--after-sync]
- *   no flag        right after the send: transient@, throttled@ and flaky@ wait in retry, rejected@ is rejected
- *   --after-retry  after retry runs: flaky@ is accepted, transient@ and throttled@ are still retry while fewer
- *                  than 4 attempts are logged, and rejected with reason retry_exhausted:<status> at the 4th
- *   --after-sync   after sync-stats: email_stats.is_failed is set for exactly the rejected outbox rows
+ *        php verify.php <mautic-root> <state.json> <ignored> --live [--live-raw] [--after-events]
+ *   no flag         right after the send: transient@, throttled@ and flaky@ wait in retry, rejected@ is rejected
+ *   --after-retry   after retry runs: flaky@ is accepted, transient@ and throttled@ are still retry while fewer
+ *                   than 4 attempts are logged, and rejected with reason retry_exhausted:<status> at the 4th
+ *   --after-sync    after sync-stats: email_stats.is_failed is set for exactly the rejected outbox rows
+ *   --live          a run against real SES: no fake log (the third argument is not read), only the outbox and
+ *                   Mautic's tables; every recipient is accepted through bulk with an SES message id
+ *   --live-raw      with --live: the outbox rows went through raw instead of bulk
+ *   --after-events  with --live, once SNS delivered the events: the SES event (and Do Not Contact entry) each mailbox
+ *                   simulator address produces, and sent or delivered for every other address
  * Exit code 0 when every check passes, 1 when a check fails, 2 on bad arguments.
  */
 
@@ -18,8 +24,11 @@ $root = rtrim($argv[1] ?? '', '/');
 $stateFile = $argv[2] ?? '';
 $logFile = $argv[3] ?? '';
 $flags = array_slice($argv, 4);
-if (!is_file($root.'/config/local.php') || !is_file($stateFile) || !is_file($logFile) || [] !== array_diff($flags, ['--after-retry', '--after-sync'])) {
-    fwrite(STDERR, "usage: verify.php <mautic-root> <state.json> <fake-ses-log.jsonl> [--after-retry] [--after-sync]\n");
+$live = in_array('--live', $flags, true);
+// The flags of one mode are refused in the other.
+$known = $live ? ['--live', '--live-raw', '--after-events'] : ['--after-retry', '--after-sync'];
+if (!is_file($root.'/config/local.php') || !is_file($stateFile) || (!$live && !is_file($logFile)) || [] !== array_diff($flags, $known)) {
+    fwrite(STDERR, "usage: verify.php <mautic-root> <state.json> <fake-ses-log.jsonl> [--after-retry] [--after-sync]\n       verify.php <mautic-root> <state.json> <ignored> --live [--live-raw] [--after-events]\n");
     exit(2);
 }
 $afterRetry = in_array('--after-retry', $flags, true);
@@ -49,6 +58,82 @@ $check = static function (bool $ok, string $label, string $detail = '') use (&$f
     printf("%s %s%s\n", $ok ? 'PASS' : 'FAIL', $label, '' !== $detail ? ' — '.$detail : '');
 };
 $recipient = static fn (string $to): string => strtolower(trim(preg_match('/<([^>]+)>/', $to, $m) ? $m[1] : $to));
+
+// ---- live run against real SES: outbox and Mautic tables only ------------------------------------
+if ($live) {
+    $operation = in_array('--live-raw', $flags, true) ? 'raw' : 'bulk';
+    $deliveries = $pdo->query(sprintf(
+        'SELECT d.tracking_hash, d.state, d.event, d.reason, d.message_id, c.operation FROM %sses_bulk_deliveries d JOIN %sses_bulk_contents c ON c.id = d.content_id WHERE d.email_id = %d',
+        $prefix, $prefix, $emailId
+    ))->fetchAll(PDO::FETCH_ASSOC);
+    $stats = $pdo->query(sprintf('SELECT tracking_hash, email_address FROM %semail_stats WHERE email_id = %d', $prefix, $emailId))->fetchAll(PDO::FETCH_ASSOC);
+    // Seeded address -> outbox row, through the tracking hash Mautic stored in email_stats.
+    $addressByHash = [];
+    foreach ($stats as $stat) {
+        $addressByHash[$stat['tracking_hash']] = strtolower($stat['email_address']);
+    }
+    $rows = array_fill_keys(array_keys($seeded), null);
+    foreach ($deliveries as $row) {
+        $address = $addressByHash[$row['tracking_hash']] ?? '';
+        if (array_key_exists($address, $rows)) {
+            $rows[$address] = $row;
+        }
+    }
+    // Do Not Contact entries per seeded address. Mautic's reasons: 1 unsubscribed (complaints), 2 bounced, 3 manual.
+    $dncNames = [1 => 'unsubscribed', 2 => 'bounced', 3 => 'manual'];
+    $dnc = array_fill_keys(array_keys($seeded), []);
+    $addressOf = array_combine($contactIds, array_keys($seeded));
+    if ([] !== $contactIds) {
+        foreach ($pdo->query(sprintf('SELECT lead_id, channel, reason FROM %slead_donotcontact WHERE lead_id IN (%s)', $prefix, implode(',', $contactIds)))->fetchAll(PDO::FETCH_ASSOC) as $entry) {
+            $dnc[$addressOf[(int) $entry['lead_id']]][] = ['channel' => $entry['channel'], 'reason' => (int) $entry['reason']];
+        }
+    }
+
+    $ops = array_count_values(array_column($deliveries, 'operation'));
+    printf("outbox: %d deliveries, states=%s, operations=%s, events=%s\n", count($deliveries), json_encode(array_count_values(array_column($deliveries, 'state'))), json_encode($ops), json_encode(array_count_values(array_column($deliveries, 'event'))));
+    $table = [['recipient', 'operation', 'state', 'event', 'reason', 'message id', 'do not contact']];
+    foreach ($rows as $address => $row) {
+        $dncText = implode(',', array_map(static fn (array $e): string => ('email' === $e['channel'] ? '' : $e['channel'].':').($dncNames[$e['reason']] ?? (string) $e['reason']), $dnc[$address])) ?: '-';
+        $table[] = null === $row
+            ? [$address, '-', 'no outbox row', '-', '-', '-', $dncText]
+            : [$address, $row['operation'], $row['state'], $row['event'] ?: '-', $row['reason'] ?: '-', $row['message_id'] ?: '-', $dncText];
+    }
+    $widths = array_map(static fn (int $column): int => max(array_map(static fn (array $line): int => strlen($line[$column]), $table)), array_keys($table[0]));
+    foreach ($table as $line) {
+        echo rtrim(implode('  ', array_map(static fn (string $cell, int $width): string => str_pad($cell, $width), $line, $widths))), "\n";
+    }
+    echo "\n";
+
+    $check(count($deliveries) === count($seeded), 'one outbox row per seeded recipient', sprintf('%d rows vs %d seeded', count($deliveries), count($seeded)));
+    $check(($ops[$operation] ?? 0) === count($deliveries), "every recipient was submitted through $operation", json_encode($ops));
+    $notAccepted = array_filter($deliveries, static fn (array $row): bool => 'accepted' !== $row['state'] || '' === $row['message_id']);
+    $check([] === $notAccepted, 'every recipient is accepted with an SES message id', implode(', ', array_map(static fn (array $row): string => sprintf('%s %s%s', $addressByHash[$row['tracking_hash']] ?? $row['tracking_hash'], $row['state'], '' === $row['message_id'] ? ' without message id' : ''), $notAccepted)));
+    $check(count($stats) === count($seeded), 'Mautic recorded one email_stats row per recipient', count($stats).' rows');
+    if (in_array('--after-events', $flags, true)) {
+        // SES event and email Do Not Contact reason per mailbox simulator local part (a +label may follow it).
+        $simulated = ['success' => ['delivered', null], 'ooto' => ['delivered', null], 'bounce' => ['bounced', 2], 'suppressionlist' => ['bounced', 2], 'complaint' => ['complained', 1]];
+        foreach ($rows as $address => $row) {
+            [$local, $domain] = explode('@', $address, 2);
+            $local = explode('+', $local, 2)[0];
+            $event = (string) ($row['event'] ?? '');
+            $reasons = array_column(array_filter($dnc[$address], static fn (array $e): bool => 'email' === $e['channel']), 'reason');
+            if ('simulator.amazonses.com' === $domain && isset($simulated[$local])) {
+                [$wantEvent, $wantDnc] = $simulated[$local];
+                $check(
+                    $event === $wantEvent && (null === $wantDnc || in_array($wantDnc, $reasons, true)),
+                    "$address has SES event $wantEvent".(null === $wantDnc ? '' : ' and a Do Not Contact entry with reason '.$dncNames[$wantDnc]),
+                    sprintf('event %s, email Do Not Contact reasons [%s]', $event ?: 'none', implode(',', $reasons))
+                );
+            } else {
+                // Any other address is a real mailbox: at least the Send event, and no failure.
+                $check(in_array($event, ['sent', 'delivered'], true), "$address has SES event sent or delivered", 'event '.($event ?: 'none'));
+            }
+        }
+    }
+
+    printf("\n%s: %d failing check(s)\n", 0 === $failures ? 'ALL CHECKS PASSED' : 'CHECKS FAILED', $failures);
+    exit(0 === $failures ? 0 : 1);
+}
 
 // ---- fake SES request log -------------------------------------------------------------------
 $bulkRequests = [];
