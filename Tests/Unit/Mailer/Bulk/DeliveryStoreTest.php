@@ -453,4 +453,130 @@ class DeliveryStoreTest extends TestCase
         self::assertSame(['deliveries' => 2, 'contents' => 0], $store->prune(30));
         self::assertSame(1, (int) $db->fetchOne('SELECT COUNT(*) FROM ses_bulk_contents WHERE created_at > ?', [$old]));
     }
+
+    /** @dataProvider concurrentEvents */
+    public function testConcurrentEventsKeepTheHigherRank(string $outer, string $inner, string $expected): void
+    {
+        $logger = new class() extends AbstractLogger {
+            public ?\Closure $interleave = null;
+            public bool $interleaved = false;
+
+            public function log($level, $message, array $context = []): void
+            {
+                if ($this->interleave && str_starts_with($context['sql'] ?? '', "UPDATE ses_bulk_deliveries SET state = 'accepted', event =")) {
+                    $callback = $this->interleave;
+                    $this->interleave = null;
+                    $this->interleaved = true;
+                    $callback();
+                }
+            }
+        };
+        $em = DeliveryStoreTest::manager([new Middleware($logger)]);
+        $store = new DeliveryStore($em);
+        $store->install();
+        $id = $store->enqueue(DeliveryStoreTest::delivery(), 'scope');
+        $payload = ['mail' => ['messageId' => 'ses-id', 'tags' => ['mautic_delivery_id' => [$id]]]];
+        // A competing callback commits between the initial read and the conditional event update.
+        $logger->interleave = fn () => (new DeliveryStore($em))->recordEvent($payload, $inner);
+        $store->recordEvent($payload, $outer);
+        self::assertTrue($logger->interleaved);
+        self::assertSame($expected, $store->summary()['recipients'][0]['event']);
+        if ('rendering_failed' === $expected) {
+            $db = $em->getConnection();
+            $db->executeStatement('CREATE TABLE email_stats (id INTEGER PRIMARY KEY, email_id INTEGER, tracking_hash VARCHAR(191), is_failed INTEGER)');
+            $db->insert('email_stats', ['id' => 1, 'email_id' => 42, 'tracking_hash' => self::delivery()['tracking_hash'], 'is_failed' => 0]);
+            self::assertSame(['reconciled' => 1, 'without_statistic' => 0], $store->syncFailures());
+            self::assertSame(1, (int) $db->fetchOne('SELECT is_failed FROM email_stats'));
+        }
+    }
+
+    public static function concurrentEvents(): array
+    {
+        return [
+            ['Rendering Failure', 'Send', 'rendering_failed'],
+            ['Send', 'Rendering Failure', 'rendering_failed'],
+            ['Complaint', 'Delivery', 'complained'],
+            ['Delivery', 'Complaint', 'complained'],
+            ['Rendering Failure', 'Rendering Failure', 'rendering_failed'],
+            ['Reject', 'Bounce', 'rejected'],
+        ];
+    }
+
+    /** @dataProvider terminalRawReplays */
+    public function testReplayKeepsFinalRawPayloadDropped(string $state, bool $batch): void
+    {
+        $em = DeliveryStoreTest::manager();
+        $store = new DeliveryStore($em);
+        $store->install();
+        $raw = DeliveryStoreTest::raw('replay');
+        $store->enqueueBatches([[$raw]], 'scope');
+        $store->complete($store->claim($raw['id'], 'scope', 'worker'), $state, '', 'ses-id');
+        self::assertSame('', $em->getConnection()->fetchOne('SELECT payload FROM ses_bulk_contents'));
+        if ($batch) {
+            $store->enqueueBatches([[$raw]], 'scope');
+        } else {
+            $store->enqueue($raw, 'scope');
+        }
+        self::assertNull($store->claim($raw['id'], 'scope', 'replay-worker'));
+        self::assertSame('', $em->getConnection()->fetchOne('SELECT payload FROM ses_bulk_contents'));
+    }
+
+    public static function terminalRawReplays(): array
+    {
+        return [['accepted', true], ['rejected', true], ['unknown', true], ['accepted', false], ['rejected', false], ['unknown', false]];
+    }
+
+    public function testOwnershipLookupIncludesEveryStateAndIsBoundedByScope(): void
+    {
+        $log = self::sqlLog();
+        $em = self::manager([new Middleware($log)]);
+        $store = new DeliveryStore($em);
+        self::assertSame([], $store->existingIds([self::delivery()['id']], 'scope'));
+        $store->install();
+        $deliveries = array_map(static fn (int $i): array => self::delivery('owned '.$i), range(1, 450));
+        $store->enqueueBatches(array_chunk($deliveries, 50), 'scope');
+        $ids = array_column($deliveries, 'id');
+        $em->getConnection()->executeStatement("UPDATE ses_bulk_deliveries SET state = 'accepted'");
+        $log->sql = [];
+        self::assertEqualsCanonicalizing($ids, array_keys($store->existingIds($ids, 'scope')));
+        self::assertCount(3, preg_grep('/^SELECT id FROM ses_bulk_deliveries /', $log->sql));
+        self::assertSame([], $store->existingIds($ids, 'another-scope'));
+        self::assertSame([], iterator_to_array($store->dueForIds($ids, 'scope')));
+    }
+
+    public function testBulkTerminalTransitionsDoNotUpdateContentPayloads(): void
+    {
+        $log = self::sqlLog();
+        $em = self::manager([new Middleware($log)]);
+        $store = new DeliveryStore($em);
+        $store->install();
+        $ids = [];
+        foreach (['complete', 'event', 'expire'] as $name) {
+            $ids[$name] = $store->enqueue(self::delivery($name), 'scope');
+        }
+        $completed = $store->claim($ids['complete'], 'scope', 'worker');
+        $store->claim($ids['expire'], 'scope', 'worker');
+        $em->getConnection()->update('ses_bulk_deliveries', ['updated_at' => 0], ['id' => $ids['expire']]);
+        $log->sql = [];
+        $store->complete($completed, 'accepted');
+        $store->recordEvent(['mail' => ['tags' => ['mautic_delivery_id' => [$ids['event']]]]], 'Delivery');
+        self::assertSame(1, $store->expireClaims('scope'));
+        self::assertCount(0, preg_grep("/^UPDATE ses_bulk_contents SET payload = ''/", $log->sql));
+
+        $raw = $store->enqueue(self::raw('raw cleanup'), 'scope');
+        $store->complete($store->claim($raw, 'scope', 'worker'), 'accepted');
+        self::assertCount(1, preg_grep("/^UPDATE ses_bulk_contents SET payload = ''/", $log->sql));
+        self::assertSame('', $em->getConnection()->fetchOne("SELECT payload FROM ses_bulk_contents WHERE operation = 'raw'"));
+    }
+
+    public function testEventWithoutMessageIdKeepsTheCurrentMessageId(): void
+    {
+        $em = self::manager();
+        $store = new DeliveryStore($em);
+        $store->install();
+        $id = $store->enqueue(self::delivery(), 'scope');
+        $store->complete($store->claim($id, 'scope', 'worker'), 'accepted', '', 'saved-id');
+        $store->recordEvent(['mail' => ['messageId' => '', 'tags' => ['mautic_delivery_id' => [$id]]]], 'Delivery');
+        self::assertSame('saved-id', $em->getConnection()->fetchOne('SELECT message_id FROM ses_bulk_deliveries'));
+    }
 }

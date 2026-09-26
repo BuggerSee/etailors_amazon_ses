@@ -162,13 +162,37 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
             $this->message = $email;
             $this->envelope = $message->getEnvelope();
 
+            $scope = null;
+            $ids = [];
+            if ('auto' === ($this->settings['bulk'] ?? 'off') && $this->canIdentifyRecipients($email)) {
+                $scope = BulkSender::scope($this->client);
+                foreach ($email->getMetadata() as $recipient => $data) {
+                    $ids[] = $this->deliveryId($scope, $recipient, $data);
+                }
+                $existing = $this->deliveryStore?->existingIds($ids, $scope) ?? [];
+                if ($existing) {
+                    try {
+                        // Replay uses saved content. Only recipients whose rows are missing need current Email fields.
+                        if (count($existing) < count($ids)) {
+                            $this->updateEmailFields($email);
+                        }
+                        $this->sendWithBulkAdapter($scope, $ids, $existing);
+                    } catch (\Throwable $e) {
+                        // Existing ownership must not escape to Mautic's full-message resend under new tracking hashes.
+                        $this->logger->error('SES outbox replay stopped; recover saved recipients with mautic:ses:bulk retry.', ['exception' => $e]);
+                    }
+
+                    return;
+                }
+            }
+
             // Use centralized method for updating From address
             $this->updateEmailFields($email);
 
-            if ('auto' === ($this->settings['bulk'] ?? 'off') && $this->canIdentifyRecipients($email)) {
-                $reason = $this->bulkEligibilityReason(BulkSender::scope($this->client));
+            if (null !== $scope) {
+                $reason = $this->bulkEligibilityReason($scope);
                 if (null === $reason) {
-                    $this->sendWithBulkAdapter();
+                    $this->sendWithBulkAdapter($scope, $ids);
 
                     return;
                 }
@@ -300,23 +324,26 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
         return true;
     }
 
-    private function sendWithBulkAdapter(): void
+    /**
+     * @param list<string>        $ids
+     * @param array<string, true> $existing already-owned recipients must not be recompiled
+     */
+    private function sendWithBulkAdapter(string $scope, array $ids, array $existing = []): void
     {
         if (!$this->deliveryStore || !$this->bulkSender) {
             throw new \LogicException('SES bulk services are not configured.');
         }
         $this->deliveryStore->assertInstalled();
         BulkSender::assertSupported($this->client);
-        $scope = BulkSender::scope($this->client);
         $this->deliveryStore->expireClaims($scope);
-        [$limit, $concurrency] = $this->bulkWindow();
+        [$limit] = $this->bulkWindow();
         // Every recipient is saved in one transaction before the first request. Up to the commit a failure leaves nothing
         // behind, so the exception can go to Mautic, which counts the message as failed and sends it again later.
-        $batches = $this->deliveryStore->enqueueBatches((new BulkBatcher())->batches($this->bulkDeliveries($scope), $limit), $scope);
+        $this->deliveryStore->enqueueBatches((new BulkBatcher())->batches($this->bulkDeliveries($scope, $existing), $limit), $scope);
         $emailId = $this->getEmailIdFromMetadata($this->message->getMetadata());
         try {
-            // One send() call for all batches keeps up to $concurrency requests in flight.
-            $this->bulkSender->send($this->client, $batches, fn (int $recipients) => $this->acquireRecipientQuota($recipients), $concurrency);
+            // Read what actually won the inserts, including content another worker saved first.
+            $this->sendSavedRows($this->deliveryStore->dueForIds($ids, $scope));
         } catch (\Throwable $e) {
             // From here on the outbox owns every recipient: submitted ones are recorded or expire to unknown, the others
             // stay due for mautic:ses:bulk retry. Throwing would make Mautic send the whole message again under new
@@ -338,7 +365,7 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
     private function bulkWindow(): array
     {
         $rate = max(1, (int) ($this->settings['maxSendRate'] ?? 14));
-        $concurrency = max(1, (int) ($this->settings['bulkConcurrency'] ?? 2));
+        $concurrency = min($rate, max(1, (int) ($this->settings['bulkConcurrency'] ?? 2)));
 
         return [min(50, (int) ($this->settings['bulkBatchSize'] ?? 50), max(1, intdiv($rate, $concurrency))), $concurrency];
     }
@@ -366,9 +393,21 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
         $scope = BulkSender::scope($this->client);
         $this->deliveryStore->expireClaims($scope);
         $due = $this->deliveryStore->due($scope, $limit);
-        $deliveries = (function () use ($due): \Generator {
-            foreach ($due as $row) {
-                $content = $this->deliveryStore->content($row['content_id']);
+        $this->sendSavedRows($due);
+
+        return count($due);
+    }
+
+    /** Queue replays and cron recovery both batch persisted content, never newly rendered replacements. */
+    private function sendSavedRows(iterable $rows): void
+    {
+        $deliveries = (function () use ($rows): \Generator {
+            $content = null;
+            foreach ($rows as $row) {
+                // Shared content is immutable. Raw content can be dropped by another worker, so always reread it.
+                if (null === $content || $content['id'] !== $row['content_id'] || 'raw' === $content['operation']) {
+                    $content = $this->deliveryStore->content($row['content_id']);
+                }
                 if (null === $content['payload']) {
                     // Another process made this raw delivery final since due() listed it, so its claim would fail anyway.
                     continue;
@@ -384,8 +423,6 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
             }
         })((new BulkBatcher())->batches($deliveries, $count));
         $this->bulkSender->send($this->client, $batches, fn (int $recipients) => $this->acquireRecipientQuota($recipients), $concurrency);
-
-        return count($due);
     }
 
     /** Judged on the first recipient only, before anything is persisted, charged or submitted. */
@@ -402,9 +439,13 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
         return null;
     }
 
-    private function bulkDeliveries(string $scope): \Generator
+    /** @param array<string, true> $existing */
+    private function bulkDeliveries(string $scope, array $existing = []): \Generator
     {
         foreach ($this->message->getMetadata() as $recipient => $data) {
+            if (isset($existing[$this->deliveryId($scope, $recipient, $data)])) {
+                continue;
+            }
             $reason = '';
             try {
                 ['id' => $id, 'common' => $common, 'entry' => $entry] = $this->bulkEntry($scope, $recipient, $data);

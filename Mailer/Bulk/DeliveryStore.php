@@ -24,6 +24,7 @@ final class DeliveryStore
     private const BYTES_PER_INSERT = 4 * 1024 * 1024;
     /** States no delivery leaves for a submission again; rows in them keep only bookkeeping. */
     private const FINAL_STATES = ['accepted', 'rejected', 'unknown'];
+    private const EVENT_RANK = ['' => 0, 'sent' => 1, 'delivered' => 2, 'bounced' => 3, 'rendering_failed' => 3, 'rejected' => 3, 'complained' => 4];
 
     private string $deliveries;
     private string $contents;
@@ -86,6 +87,48 @@ final class DeliveryStore
     }
 
     /**
+     * Ownership survives changes to the Email entity's current headers and template eligibility.
+     * Only absent tables mean no ownership; database errors must never permit an untracked raw send.
+     *
+     * @param list<string> $ids
+     *
+     * @return array<string, true>
+     */
+    public function existingIds(array $ids, string $scope): array
+    {
+        $db = $this->entityManager->getConnection();
+        if (!$this->ready && !$db->createSchemaManager()->tablesExist([$this->deliveries])) {
+            return [];
+        }
+        $existing = [];
+        foreach (array_chunk($ids, self::ROWS_PER_INSERT) as $chunk) {
+            $found = $db->fetchFirstColumn("SELECT id FROM {$this->deliveries} WHERE scope = ? AND id IN (".implode(', ', array_fill(0, count($chunk), '?')).')', [$scope, ...$chunk]);
+            foreach ($found as $id) {
+                $existing[$id] = true;
+            }
+        }
+
+        return $existing;
+    }
+
+    /** @param list<string> $ids */
+    public function dueForIds(array $ids, string $scope): \Generator
+    {
+        foreach (array_chunk($ids, self::ROWS_PER_INSERT) as $chunk) {
+            $rows = array_column($this->entityManager->getConnection()->fetchAllAssociative(
+                "SELECT * FROM {$this->deliveries} WHERE scope = ? AND state IN ('pending', 'retry') AND next_attempt <= ? AND attempts < 4 AND id IN (".implode(', ', array_fill(0, count($chunk), '?')).')',
+                [$scope, time(), ...$chunk]
+            ), null, 'id');
+            // Queue replays retain recipient order; cron recovery retains due()'s content ordering.
+            foreach ($chunk as $id) {
+                if (isset($rows[$id])) {
+                    yield $rows[$id];
+                }
+            }
+        }
+    }
+
+    /**
      * Saves every delivery of one message in a single transaction before anything is submitted. A failure rolls all of
      * them back, so nothing is left for the retry command while Mautic handles the failed message itself.
      *
@@ -105,7 +148,7 @@ final class DeliveryStore
             foreach ($batches as $batch) {
                 foreach ($batch as $delivery) {
                     $rows[] = $row = $this->deliveryRow($delivery, $scope);
-                    $bytes += strlen($row['entry']);
+                    $bytes += strlen($row['entry']) + strlen($row['_raw_payload'] ?? '');
                     if (self::ROWS_PER_INSERT === count($rows) || $bytes >= self::BYTES_PER_INSERT) {
                         $this->insertDeliveries($rows);
                         [$rows, $bytes] = [[], 0];
@@ -123,7 +166,14 @@ final class DeliveryStore
     public function enqueue(array $delivery, string $scope): string
     {
         $this->assertInstalled();
-        $this->insertDeliveries([$this->deliveryRow($delivery, $scope)]);
+        try {
+            $this->entityManager->getConnection()->transactional(function () use ($delivery, $scope): void {
+                $this->insertDeliveries([$this->deliveryRow($delivery, $scope)]);
+            });
+        } catch (\Throwable $e) {
+            $this->contentIds = [];
+            throw $e;
+        }
 
         return $delivery['id'];
     }
@@ -145,22 +195,23 @@ final class DeliveryStore
             } catch (UniqueConstraintViolationException) {
                 // Common content is shared across recipients and workers. created_at is the last use, so prune keeps it.
                 $db->update($this->contents, ['created_at' => $now], ['id' => $contentId]);
-                if ('raw' === $delivery['operation']) {
-                    // A raw content dropped its message when its delivery became final. A replay after that delivery was
-                    // pruned saves it again as pending, which needs the message back.
-                    $db->executeStatement("UPDATE {$this->contents} SET payload = ? WHERE id = ? AND payload = ''", [json_encode($delivery['common'], JSON_THROW_ON_ERROR), $contentId]);
-                }
             }
             $this->contentIds[$contentId] = true;
         }
 
-        return [
+        $row = [
             'id' => $delivery['id'], 'content_id' => $contentId, 'email_id' => $delivery['email_id'],
             'tracking_hash' => $delivery['tracking_hash'], 'scope' => $scope,
             'entry' => json_encode($delivery['entry'], JSON_THROW_ON_ERROR), 'state' => 'pending',
             'event' => '', 'reason' => $delivery['reason'], 'message_id' => '', 'attempts' => 0,
             'next_attempt' => 0, 'updated_at' => $now, 'created_at' => $now, 'claim' => '', 'synced' => 0,
         ];
+        if ('raw' === $delivery['operation']) {
+            // Internal insert metadata, removed before binding the delivery columns.
+            $row['_raw_payload'] = json_encode($delivery['common'], JSON_THROW_ON_ERROR);
+        }
+
+        return $row;
     }
 
     /**
@@ -174,6 +225,14 @@ final class DeliveryStore
             return;
         }
         $db = $this->entityManager->getConnection();
+        $raw = [];
+        foreach ($rows as &$row) {
+            if (isset($row['_raw_payload'])) {
+                $raw[] = [$row['_raw_payload'], $row['content_id'], $row['id'], $row['scope']];
+                unset($row['_raw_payload']);
+            }
+        }
+        unset($row);
         $platform = $db->getDatabasePlatform();
         if ($platform instanceof AbstractMySQLPlatform) {
             $onDuplicate = 'ON DUPLICATE KEY UPDATE id = id';
@@ -188,6 +247,8 @@ final class DeliveryStore
                 }
             }
 
+            $this->restoreRawPayloads($raw);
+
             return;
         }
         $values = implode(', ', array_fill(0, count($rows), '('.implode(', ', array_fill(0, count($rows[0]), '?')).')'));
@@ -195,6 +256,25 @@ final class DeliveryStore
             "INSERT INTO {$this->deliveries} (".implode(', ', array_keys($rows[0])).") VALUES {$values} {$onDuplicate}",
             array_merge(...array_map('array_values', $rows))
         );
+        $this->restoreRawPayloads($raw);
+    }
+
+    /**
+     * Called inside enqueue's transaction, after the insert has locked each actual delivery (including duplicates).
+     * A completion either precedes this check, or waits until restoration commits and then drops the payload itself.
+     * The order for enqueue is content, then delivery; completion/event/expiry release their delivery UPDATE's lock
+     * before touching content, so they do not hold the reverse pair of locks.
+     *
+     * @param list<array{string, string, string, string}> $raw
+     */
+    private function restoreRawPayloads(array $raw): void
+    {
+        foreach ($raw as [$payload, $contentId, $id, $scope]) {
+            $this->entityManager->getConnection()->executeStatement(
+                "UPDATE {$this->contents} SET payload = ? WHERE id = ? AND payload = '' AND EXISTS (SELECT 1 FROM {$this->deliveries} d WHERE d.id = ? AND d.scope = ? AND d.content_id = {$this->contents}.id AND d.state IN ('pending', 'retry', 'sending'))",
+                [$payload, $contentId, $id, $scope]
+            );
+        }
     }
 
     /** Atomic ownership prevents two workers submitting the same delivery. */
@@ -209,7 +289,7 @@ final class DeliveryStore
             return null;
         }
 
-        return $db->fetchAssociative("SELECT * FROM {$this->deliveries} WHERE id = ?", [$id]) ?: null;
+        return $db->fetchAssociative("SELECT d.*, c.operation FROM {$this->deliveries} d LEFT JOIN {$this->contents} c ON c.id = d.content_id WHERE d.id = ?", [$id]) ?: null;
     }
 
     /** @return string the state written, rejected when the last retry was used up */
@@ -227,7 +307,7 @@ final class DeliveryStore
             "UPDATE {$this->deliveries} SET state = ?, entry = CASE WHEN ? IN ('accepted', 'rejected', 'unknown') THEN '' ELSE entry END, reason = CASE WHEN ? = 'accepted' AND (attempts > 1 OR reason IN ('local_preflight_failure', 'ACCOUNT_DAILY_QUOTA_EXCEEDED')) THEN '' WHEN ? = '' THEN reason ELSE ? END, message_id = CASE WHEN ? = '' THEN message_id ELSE ? END, next_attempt = ?, updated_at = ?, synced = 0 WHERE id = ? AND claim = ? AND state = 'sending'",
             [$state, $state, $state, $reason, substr($reason, 0, 128), $messageId, $messageId, time() + min(3600, 30 * (2 ** (int) $row['attempts'])), time(), $row['id'], $row['claim']]
         );
-        if ($changed && in_array($state, self::FINAL_STATES, true)) {
+        if ($changed && 'raw' === $row['operation'] && in_array($state, self::FINAL_STATES, true)) {
             $this->dropRawPayloads([$row['content_id']]);
         }
 
@@ -287,7 +367,7 @@ final class DeliveryStore
         );
         if ($expired) {
             // The rows just expired carry $now. Another unknown row found here is final as well.
-            $this->dropRawPayloads($db->fetchFirstColumn("SELECT DISTINCT content_id FROM {$this->deliveries} WHERE state = 'unknown' AND updated_at = ? AND scope = ?", [$now, $scope]));
+            $this->dropRawPayloads($db->fetchFirstColumn("SELECT DISTINCT d.content_id FROM {$this->deliveries} d INNER JOIN {$this->contents} c ON c.id = d.content_id WHERE d.state = 'unknown' AND d.updated_at = ? AND d.scope = ? AND c.operation = 'raw'", [$now, $scope]));
         }
 
         return $expired;
@@ -307,20 +387,18 @@ final class DeliveryStore
         $this->assertInstalled();
         // Events can arrive before the HTTP response. Do not overwrite a later terminal event with Send/Delivery.
         $db = $this->entityManager->getConnection();
-        $row = $db->fetchAssociative("SELECT * FROM {$this->deliveries} WHERE id = ?", [$id]);
+        $row = $db->fetchAssociative("SELECT d.*, c.operation FROM {$this->deliveries} d INNER JOIN {$this->contents} c ON c.id = d.content_id WHERE d.id = ?", [$id]);
         if (!$row) {
             return;
         }
-        $rank = ['' => 0, 'sent' => 1, 'delivered' => 2, 'bounced' => 3, 'rendering_failed' => 3, 'rejected' => 3, 'complained' => 4];
-        if (($rank[$row['event']] ?? 0) > $rank[$event]) {
-            return;
-        }
+        $allowed = array_keys(array_filter(self::EVENT_RANK, static fn (int $rank): bool => $rank <= self::EVENT_RANK[$event]));
+        $messageId = (string) ($payload['mail']['messageId'] ?? '');
         $changed = $db->executeStatement(
-            "UPDATE {$this->deliveries} SET state = 'accepted', event = ?, message_id = ?, entry = '', updated_at = ?, synced = 0 WHERE id = ? AND event = ?",
-            [$event, (string) ($payload['mail']['messageId'] ?? $row['message_id']), time(), $id, $row['event']]
+            "UPDATE {$this->deliveries} SET state = 'accepted', event = ?, message_id = CASE WHEN ? = '' THEN message_id ELSE ? END, entry = '', updated_at = ?, synced = 0 WHERE id = ? AND event IN (".implode(', ', array_fill(0, count($allowed), '?')).')',
+            [$event, $messageId, $messageId, time(), $id, ...$allowed]
         );
         // A row that was final already dropped its raw content when it became final.
-        if ($changed && !in_array($row['state'], self::FINAL_STATES, true)) {
+        if ($changed && 'raw' === $row['operation'] && !in_array($row['state'], self::FINAL_STATES, true)) {
             $this->dropRawPayloads([$row['content_id']]);
         }
     }
@@ -335,7 +413,7 @@ final class DeliveryStore
     {
         if ($contentIds) {
             $this->entityManager->getConnection()->executeStatement(
-                "UPDATE {$this->contents} SET payload = '' WHERE id IN (".implode(', ', array_fill(0, count($contentIds), '?')).") AND operation = 'raw'", $contentIds
+                "UPDATE {$this->contents} SET payload = '' WHERE id IN (".implode(', ', array_fill(0, count($contentIds), '?')).") AND operation = 'raw' AND NOT EXISTS (SELECT 1 FROM {$this->deliveries} d WHERE d.content_id = {$this->contents}.id AND d.state IN ('pending', 'retry', 'sending'))", $contentIds
             );
         }
     }

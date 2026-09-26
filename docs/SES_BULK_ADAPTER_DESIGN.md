@@ -20,14 +20,20 @@ file lists where each part lives, the limits that decide eligibility and what is
 ## Invariants
 
 - A delivery is identified by `sha256(scope | email ID | tracking hash | recipient)`, where the scope is the SES region
-  and access key. A re-delivered Messenger message maps to the same rows and cannot reset their outcome.
+  and access key. A re-delivered Messenger message maps to the same rows and uses their saved content and state before checking
+  current template eligibility; edits to the Email entity cannot send a terminal recipient through raw fallback.
 - Every recipient of a message is recorded in one transaction before the first request. A failure up to the commit
   reaches Mautic and leaves nothing behind; a failure after it is logged and left to the outbox, because Mautic would
   otherwise resend the message under new tracking hashes.
 - SDK retries are disabled. An outcome that may follow acceptance (timeout, broken connection, HTTP 5xx, malformed
   result, expired claim) is `unknown` and never resubmitted automatically; only SES events resolve it.
 - Every submission is charged per recipient against the shared token bucket. A request carries at most
-  send rate / `bulk_concurrency` recipients, because the requests of one window can reach SES together.
+  send rate / effective concurrency recipients, because the requests of one window can reach SES together.
+  Effective concurrency is capped at the recipient rate; a rate of one submits one request at a time.
+- Event precedence is checked by the database UPDATE itself, so overlapping callbacks cannot discard a
+  higher-ranked event in favor of a lower-ranked one.
+- Terminal raw deliveries retain empty payloads on replay; restoration checks the persisted delivery inside
+  the enqueue transaction. Bulk completions do not issue a raw-payload cleanup UPDATE.
 - Claims that never reached SES (a local failure) and, for 30 hours, recipients over the 24-hour quota are handed back
   without using up one of the four attempts.
 
@@ -45,7 +51,7 @@ recipient that fails is sent raw on its own, through the outbox.
   name over 126 bytes or a value over 870 bytes or with a line break, header characters outside printable ASCII,
   invalid UTF-8, literal `{{` or `}}` in a token value. Header values that resolve to an empty string are left out.
 - Request: at most 50 entries, 1,000,000 bytes (headroom below the documented inline limit) and
-  send rate / `bulk_concurrency` recipients.
+  send rate / effective concurrency recipients.
 
 ## Open validation items
 

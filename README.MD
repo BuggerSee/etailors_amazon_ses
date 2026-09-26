@@ -208,8 +208,8 @@ bucket as raw sending, so bulk sending saves requests and upload volume; it does
 | DSN option         | Values                               | Default | Meaning                                                                                                                                                                                                                                  |
 |--------------------|--------------------------------------|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `bulk`             | `off`, `auto`                        | `off`   | `auto` sends eligible emails through shared templates; `off` sends raw MIME only.                                                                                                                                                        |
-| `bulk_batch_size`  | 1 to 50                              | `50`    | Maximum recipients per `SendBulkEmail` request. Requests are also limited to 1,000,000 bytes and to the effective send rate (`ratelimit` or the SES `MaxSendRate`) divided by `bulk_concurrency`, in recipients.                         |
-| `bulk_concurrency` | 1 to 10                              | `2`     | Requests one sending process (or one `retry` run) keeps in flight. They can reach SES at the same moment, so each carries at most send rate / `bulk_concurrency` recipients and a full window never exceeds one second of the send rate. |
+| `bulk_batch_size`  | 1 to 50                              | `50`    | Maximum recipients per `SendBulkEmail` request. Requests are also limited to 1,000,000 bytes and to the effective send rate (`ratelimit` or the SES `MaxSendRate`) divided by the effective concurrency, in recipients.                         |
+| `bulk_concurrency` | 1 to 10                              | `2`     | Maximum requests one sending process (or one `retry` run) keeps in flight, capped at the effective recipient send rate. Each request carries at most send rate / effective concurrency recipients; at rate 1, requests are sequential. |
 | `endpoint`         | absolute `http://` or `https://` URL | not set | Replaces the regional SES API endpoint, for example with an SES VPC endpoint or the local fake server. URL-encode it in a DSN string; the Email Settings form encodes option values itself.                                              |
 
 Other values are rejected when the transport is created. Example:
@@ -248,7 +248,9 @@ Clear Mautic's cache after changing the DSN.
 
 The plugin decides before anything is submitted. Bulk sending needs Mautic's recipient metadata: every recipient must
 carry a tracking hash and an email ID, as the recipients of segment emails do. Emails without it are always sent raw.
-For the others, the plugin checks the first recipient. If that recipient cannot use a shared template, the whole
+For recipients already in the outbox, a replay uses their saved content and state, even if the Email entity's headers
+have since changed. Only due pending/retry recipients can be claimed again; terminal recipients stay final.
+For a fresh message, the plugin checks the first recipient. If that recipient cannot use a shared template, the whole
 email takes the raw path of `bulk=off` unchanged (raw MIME per recipient, micro-batches, inline retries after 1, 2
 and 4 seconds) and nothing is written to the outbox. The transport logs
 `SES raw sending: message is not eligible for shared templates.` with the reason at `info` level, which Mautic's
@@ -329,8 +331,9 @@ The address, the token values, the headers and a raw recipient's stored message 
 can still be submitted (`pending`, `retry` or `sending`). When it becomes `accepted`, `rejected` or `unknown`, they are
 deleted and its row keeps only bookkeeping (IDs, tracking hash, state, SES event, reason, attempts and the SES message
 ID), about 1 KB with its indexes. The 10 KB per recipient above therefore apply to recipients still waiting for a
-submission; a sent newsletter of 150,000 recipients keeps about 150 MB until `prune` deletes it. A Messenger message
-that is processed again stores its raw recipients' messages again, and they stay until `prune` deletes them.
+submission; a sent newsletter of 150,000 recipients keeps about 150 MB until `prune` deletes it. Replaying a Messenger
+message keeps terminal raw payloads deleted. A raw payload is restored only when an active delivery needs it,
+including a delivery recreated after pruning.
 
 ### Outcomes and retries
 
@@ -347,7 +350,8 @@ that is processed again stores its raw recipients' messages again, and they stay
   `rendering_failed` or `rejected` once the SNS events arrive.
 - `unknown` is never retried automatically: SES offers no idempotency key, so a resubmission could send the email
   twice. An SES event for the delivery later marks it `accepted` with that event.
-- Rows in `retry` are resubmitted only by `mautic:ses:bulk retry`. There are up to 3 retries, which become due 60 s,
+- Rows in `retry` are resubmitted when due by `mautic:ses:bulk retry` or a replay of their original queue message.
+  There are up to 3 retries, which become due 60 s,
   120 s and 240 s after the failed attempt; with the cron above, a retry runs up to 5 minutes after it becomes due.
   If the fourth attempt also ends in `retry`, the row becomes `rejected` with reason `retry_exhausted:<status>`.
 - Two cases do not use up attempts. A `local_preflight_failure` never reached SES; it is due again after 60 s. A

@@ -402,13 +402,15 @@ class AmazonSesTransportBulkTest extends TestCase
         ];
     }
 
-    private function transport(array $settings = [], bool $bulkServices = true, ?LoggerInterface $logger = null): AmazonSesTransport
+    private function transport(array $settings = [], bool $bulkServices = true, ?LoggerInterface $logger = null, ?\Mautic\EmailBundle\Entity\Email $entity = null): AmazonSesTransport
     {
         $paths = $this->createMock(PathsHelper::class);
         $paths->method('getSystemPath')->with('cache', true)->willReturn($this->cache);
         // Mautic's EmailRepository requires a ManagerRegistry, so the Email lookup is stubbed (no entity: no From/Reply-To override).
         $emails = $this->createMock(EntityManagerInterface::class);
-        $emails->method('getRepository')->willReturn($this->createMock(EntityRepository::class));
+        $repository = $this->createMock(EntityRepository::class);
+        $repository->method('find')->willReturn($entity);
+        $emails->method('getRepository')->willReturn($repository);
 
         return new AmazonSesTransport(
             $this->client,
@@ -481,5 +483,113 @@ class AmazonSesTransportBulkTest extends TestCase
         sort($rows);
 
         return $rows;
+    }
+
+    public function testReplayAfterCustomHeaderChangeDoesNotResendAcceptedRecipient(): void
+    {
+        $entity = new \Mautic\EmailBundle\Entity\Email();
+        $transport = $this->transport(entity: $entity);
+        $queued = serialize($this->message());
+        $transport->send(unserialize($queued));
+        $entity->setHeaders(['Organization' => 'Example']);
+        $transport->send(unserialize($queued));
+
+        self::assertSame(['SendBulkEmail'], array_column($this->calls, 0));
+        self::assertSame([['bulk', 'accepted', '', 2]], $this->recipients());
+    }
+
+    public function testSandboxRateOneSpacesActualDispatch(): void
+    {
+        $times = [];
+        $client = BulkSenderTest::client(static function ($command) use (&$times) {
+            $times[] = microtime(true);
+            return Create::promiseFor(new Result(['BulkEmailEntryResults' => [['Status' => 'SUCCESS', 'MessageId' => 'ses-id']]]));
+        });
+        $store = new DeliveryStore(DeliveryStoreTest::manager());
+        $store->install();
+        $scope = BulkSender::scope($client);
+        $ids = array_map(fn ($name) => $store->enqueue(DeliveryStoreTest::delivery($name), $scope), ['a', 'b']);
+        $transport = (new \ReflectionClass(AmazonSesTransport::class))->newInstanceWithoutConstructor();
+        (new \ReflectionProperty($transport, 'settings'))->setValue($transport, ['maxSendRate' => 1, 'bulkConcurrency' => 2]);
+        [$size, $concurrency] = (new \ReflectionMethod($transport, 'bulkWindow'))->invoke($transport);
+        $bucket = tempnam($this->cache, 'rate-review-');
+        file_put_contents($bucket, json_encode(['tokens' => 1, 'last_time' => microtime(true)]));
+        try {
+            $acquire = fn (int $count) => (new \ReflectionMethod($transport, 'acquireTokens'))->invoke($transport, $bucket, $count, 1);
+            (new BulkSender($store, new NullLogger()))->send($client, array_chunk($ids, $size), $acquire, $concurrency);
+        } finally {
+            unlink($bucket);
+        }
+        self::assertGreaterThan(0.9, $times[1] - $times[0], 'One second of token waiting did not space dispatches.');
+    }
+
+    public function testReplayKeepsSavedContentAndOnlySubmitsDueOrMissingRecipients(): void
+    {
+        $scope = BulkSender::scope($this->client);
+        $message = (new MauticMessage())->from('news@example.test')->to('accepted@example.test')->subject('Changed')->html('Changed body');
+        $ids = [];
+        foreach (['accepted', 'pending', 'due', 'future', 'unknown', 'sending', 'rejected', 'missing'] as $name) {
+            $recipient = $name.'@example.test';
+            $metadata = ['emailId' => 42, 'hashId' => 'hash-'.$name, 'tokens' => []];
+            $message->addMetadata($recipient, $metadata);
+            $id = $ids[$name] = hash('sha256', $scope.'|42|hash-'.$name.'|'.$recipient);
+            if ('missing' === $name) {
+                continue;
+            }
+            $delivery = DeliveryStoreTest::delivery($name);
+            $delivery['id'] = $id;
+            $delivery['tracking_hash'] = $metadata['hashId'];
+            $delivery['entry']['Destination']['ToAddresses'] = [$recipient];
+            $delivery['entry']['ReplacementTags'][0]['Value'] = $id;
+            $delivery['common']['DefaultContent']['Template']['TemplateContent']['Subject'] = 'Saved original';
+            $this->store->enqueue($delivery, $scope);
+            if (in_array($name, ['accepted', 'unknown', 'rejected'], true)) {
+                $this->store->complete($this->store->claim($id, $scope, 'first-worker'), $name);
+            } elseif ('sending' === $name) {
+                $this->store->claim($id, $scope, 'other-worker');
+            } elseif (in_array($name, ['due', 'future'], true)) {
+                $this->em->getConnection()->update('ses_bulk_deliveries', ['state' => 'retry', 'attempts' => 1, 'next_attempt' => 'future' === $name ? time() + 3600 : 0], ['id' => $id]);
+            }
+        }
+        $unrelated = $this->store->enqueue(DeliveryStoreTest::delivery('unrelated'), $scope);
+        $entity = (new \Mautic\EmailBundle\Entity\Email())->setHeaders(['Organization' => 'Changed']);
+        $transport = $this->transport(entity: $entity)->setMaxPerSecond(0);
+        $transport->send(unserialize(serialize($message)));
+        $transport->send(unserialize(serialize($message)));
+
+        self::assertSame(['SendBulkEmail', 'SendEmail'], array_column($this->calls, 0));
+        self::assertSame('Saved original', $this->calls[0][1]['DefaultContent']['Template']['TemplateContent']['Subject']);
+        self::assertSame([['pending@example.test'], ['due@example.test']], array_column(array_column($this->calls[0][1]['BulkEmailEntries'], 'Destination'), 'ToAddresses'));
+        self::assertSame(['missing@example.test'], $this->calls[1][1]['Destination']['ToAddresses']);
+        $states = $this->em->getConnection()->fetchAllKeyValue('SELECT id, state FROM ses_bulk_deliveries');
+        self::assertSame('retry', $states[$ids['future']]);
+        self::assertSame('unknown', $states[$ids['unknown']]);
+        self::assertSame('sending', $states[$ids['sending']]);
+        self::assertSame('rejected', $states[$ids['rejected']]);
+        self::assertSame('pending', $states[$unrelated]);
+    }
+
+    /** @dataProvider effectiveWindows */
+    public function testEffectiveWindowRespectsRate(int $rate, int $configured, array $expected): void
+    {
+        $transport = $this->transport(['maxSendRate' => $rate, 'bulkConcurrency' => $configured]);
+        self::assertSame($expected, (new \ReflectionMethod($transport, 'bulkWindow'))->invoke($transport));
+    }
+
+    public static function effectiveWindows(): array
+    {
+        return [[1, 10, [1, 1]], [2, 10, [1, 2]], [4, 2, [2, 2]], [80, 2, [40, 2]], [80, 1, [50, 1]]];
+    }
+
+    public function testRetryAtRateOneCapsTheConfiguredWindow(): void
+    {
+        $answered = $this->deferResponses();
+        $scope = BulkSender::scope($this->client);
+        foreach (['first', 'second'] as $name) {
+            $this->store->enqueue(DeliveryStoreTest::delivery($name), $scope);
+        }
+        file_put_contents($this->cache.'/ses_token_bucket.json', json_encode(['tokens' => 1, 'last_time' => microtime(true)]));
+        self::assertSame(2, $this->transport(['maxSendRate' => 1, 'bulkConcurrency' => 10])->retryBulk());
+        self::assertSame([0, 1], $answered->getArrayCopy());
     }
 }
