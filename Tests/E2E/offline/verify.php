@@ -8,8 +8,8 @@ declare(strict_types=1);
  *
  * Usage: php verify.php <mautic-root> <state.json> <fake-ses-log.jsonl> [--after-retry] [--after-sync]
  *   no flag        right after the send: transient@, throttled@ and flaky@ wait in retry, rejected@ is rejected
- *   --after-retry  after retry runs: flaky@ is accepted, transient@ and throttled@ are still retry
- *                  (or rejected with reason retry_exhausted:<status> once their attempts are used up)
+ *   --after-retry  after retry runs: flaky@ is accepted, transient@ and throttled@ are still retry while fewer
+ *                  than 4 attempts are logged, and rejected with reason retry_exhausted:<status> at the 4th
  *   --after-sync   after sync-stats: email_stats.is_failed is set for exactly the rejected outbox rows
  * Exit code 0 when every check passes, 1 when a check fails, 2 on bad arguments.
  */
@@ -107,11 +107,14 @@ $expectedStatus = static fn (string $local, int $attempt): string => match ($loc
     'flaky' => 1 === $attempt ? 'TRANSIENT_FAILURE' : 'SUCCESS',
     default => 'SUCCESS',
 };
-$expectedStates = static fn (string $local): array => match ($local) {
-    'transient', 'throttled' => $afterRetry ? ['retry', 'rejected'] : ['retry'],
-    'flaky' => $afterRetry ? ['accepted'] : ['retry'],
-    'rejected' => ['rejected'],
-    default => ['accepted'],
+// DeliveryStore claims a row at most 4 times; a retryable failure on the 4th attempt rejects it as retry_exhausted.
+$maxAttempts = 4;
+// [outbox state, outbox reason or null when the reason is not checked] at a recipient's latest submission.
+$expectedOutcome = static fn (string $local, int $attempt): array => match ($local) {
+    'transient', 'throttled' => $afterRetry && $attempt >= $maxAttempts ? ['rejected', 'retry_exhausted:'.$expectedStatus($local, $attempt)] : ['retry', null],
+    'flaky' => [$afterRetry ? 'accepted' : 'retry', null],
+    'rejected' => ['rejected', null],
+    default => ['accepted', null],
 };
 foreach ($bulkRequests as $i => $req) {
     $body = $req['request'] ?? null;
@@ -181,11 +184,11 @@ foreach ($bulkRequests as $i => $req) {
         }
         // The outbox row reflects the latest submission, so its state and attempts are judged there.
         if ($attempt === $logged[$address]) {
-            $wantStates = $expectedStates($local);
-            if (!in_array($row['state'], $wantStates, true)) {
-                $problems[] = "outbox state {$row['state']}, expected ".implode(' or ', $wantStates);
-            } elseif ('rejected' === $row['state'] && 'rejected' !== $local && !str_starts_with((string) $row['reason'], 'retry_exhausted:')) {
-                $problems[] = "outbox rejected with reason {$row['reason']}, expected retry_exhausted:<status>";
+            [$wantState, $wantReason] = $expectedOutcome($local, $attempt);
+            if ($row['state'] !== $wantState) {
+                $problems[] = "outbox state {$row['state']}, expected $wantState";
+            } elseif (null !== $wantReason && (string) $row['reason'] !== $wantReason) {
+                $problems[] = "outbox $wantState with reason {$row['reason']}, expected $wantReason";
             }
             if ((int) $row['attempts'] !== $attempt) {
                 $problems[] = "outbox counts {$row['attempts']} attempts, the fake SES log $attempt";

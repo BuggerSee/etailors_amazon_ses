@@ -138,8 +138,9 @@ marks the row `rejected` with reason `retry_exhausted:<status>`.
 until 60 s have passed. `run.sh retry --now` skips the wait: it runs
 `UPDATE <prefix>ses_bulk_deliveries SET next_attempt = 0 WHERE email_id = <email> AND state = 'retry'` through
 `bin/console dbal:run-sql` (the unit tests set `next_attempt` the same way) and then runs the retry command. Running
-`retry --now` three times after the send uses up all four attempts of `transient@` and `throttled@`;
-`verify --after-retry` accepts both outcomes.
+`retry --now` three times after the send uses up all four attempts of `transient@` and `throttled@`.
+`verify --after-retry` requires `retry` for them while fewer than four submissions are logged and `rejected` with
+reason `retry_exhausted:<status>` (the status the fake server returned) once four are.
 
 `mautic:ses:bulk retry` processes the due rows of every email sent with the same region and access key, not only the
 seeded one, and it reconciles failed statistics as `sync-stats` does.
@@ -156,7 +157,7 @@ email, prints `PASS`/`FAIL` per check and exits 1 when any check fails (2 on bad
 | every recipient went through the shared-template path                      | No recipient fell back to raw sending (`operation = bulk`).                     |
 | bulk request N carries an inline template                                  | `SendBulkEmail` uses `DefaultContent.Template.TemplateContent` with subject and HTML. |
 | bulk request N has <=50 entries and one result per entry                   | Batches respect the SES entry limit.                                            |
-| entry N renders and reconciles                                             | Per submission: the verifier substitutes `{{var}}` from the entry's replacement data and finds the recipient's address and tracking hash in the HTML, no unreplaced Mautic token (`{contactfield=…}`, `{unsubscribe_text}`, `{webview_text}`, `{tracking_pixel}`, `{trackable=…}`, `{leadfield=…}`), no leftover `{{`/missing variable, a `List-Unsubscribe` header with the recipient's hash, the `mautic_delivery_id` and `X-EMAIL-ID` tags, the fake status expected for that local part and attempt, the SES `MessageId` stored on accepted rows, and resubmission only after `TRANSIENT_FAILURE`/`ACCOUNT_THROTTLED`. At a recipient's latest submission it also checks the outbox state and that the outbox attempt count equals the number of logged submissions. |
+| entry N renders and reconciles                                             | Per submission: the verifier substitutes `{{var}}` from the entry's replacement data and finds the recipient's address and tracking hash in the HTML, no unreplaced Mautic token (`{contactfield=…}`, `{unsubscribe_text}`, `{webview_text}`, `{tracking_pixel}`, `{trackable=…}`, `{leadfield=…}`), no leftover `{{`/missing variable, a `List-Unsubscribe` header with the recipient's hash, the `mautic_delivery_id` and `X-EMAIL-ID` tags, the fake status expected for that local part and attempt, the SES `MessageId` stored on accepted rows, and resubmission only after `TRANSIENT_FAILURE`/`ACCOUNT_THROTTLED`. At a recipient's latest submission it also checks the outbox state (and, for an exhausted retry, the reason `retry_exhausted:<status>`) and that the outbox attempt count equals the number of logged submissions. |
 | every seeded recipient appears exactly once across the initial bulk entries | The set of submitted addresses equals the seeded set; with the resubmission rule above, nothing was sent twice unless the outbox retried it. |
 | all bulk requests share one identical inline template                      | The content is shared by every batch and retries reuse the stored template.     |
 | initial request count equals ceil(recipients / 50)                         | Batches are full (holds when `BATCH` is a multiple of 50).                      |
@@ -171,7 +172,7 @@ Expected outbox states per stage:
 | `successNNN.<stamp>@…`   | `accepted` | `accepted`                                                         |
 | `rejected@`              | `rejected` | `rejected`                                                         |
 | `flaky@`                 | `retry`    | `accepted`                                                         |
-| `transient@`, `throttled@` | `retry`  | `retry`, or `rejected` with reason `retry_exhausted:<status>` once the attempts are used up |
+| `transient@`, `throttled@` | `retry`  | `retry` after 2 or 3 submissions; `rejected` with reason `retry_exhausted:TRANSIENT_FAILURE` / `retry_exhausted:ACCOUNT_THROTTLED` after the 4th |
 
 ## What the harness cannot prove
 
