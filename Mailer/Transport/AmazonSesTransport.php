@@ -461,6 +461,13 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
             if ($header instanceof MetadataHeader || in_array(strtolower($name), ['from', 'to', 'cc', 'bcc', 'reply-to', 'subject', 'date', 'message-id', 'mime-version', 'content-type', 'content-transfer-encoding'], true)) {
                 continue;
             }
+            // Mautic 7 sets Sender to the From address. SES sets the envelope sender itself and RFC 5322 only requires Sender when it differs from From.
+            if ('sender' === strtolower($name)) {
+                if (0 !== strcasecmp($message->getSender()?->getAddress() ?? '', $message->getFrom()[0]->getAddress())) {
+                    throw new IneligibleMessage('sender_differs_from_from');
+                }
+                continue;
+            }
             if (!preg_match('/^(x-|list-)/i', $name) && !in_array(strtolower($name), ['precedence', 'feedback-id', 'auto-submitted'], true)) {
                 throw new IneligibleMessage('unsupported_header');
             }

@@ -112,6 +112,31 @@ class AmazonSesTransportBulkTest extends TestCase
         self::assertSame([], $this->recipients());
     }
 
+    public function testSenderHeaderEqualToFromKeepsTheBulkPath(): void
+    {
+        // Mautic 7 sets Sender to the From address on every message. The address is compared case-insensitively.
+        $this->transport()->send($this->message()->sender(new Address('NEWS@example.test', 'Mautic')));
+
+        self::assertSame(['SendBulkEmail'], array_column($this->calls, 0));
+        $entries = $this->calls[0][1]['BulkEmailEntries'];
+        self::assertCount(2, $entries);
+        foreach ($entries as $entry) {
+            self::assertNotContains('sender', array_map('strtolower', array_column($entry['ReplacementHeaders'], 'Name')));
+        }
+        self::assertSame([['bulk', 'accepted', '', 2]], $this->recipients());
+    }
+
+    public function testSenderHeaderDifferentFromFromFallsBackToRaw(): void
+    {
+        $this->transport()->send($this->message()->sender('other@example.test'));
+
+        self::assertSame(['SendEmail', 'SendEmail'], array_column($this->calls, 0));
+        foreach ($this->calls as [, $request]) {
+            self::assertMatchesRegularExpression('/^Sender: .*other@example\.test/m', $request['Content']['Raw']['Data']);
+        }
+        self::assertSame([], $this->recipients());
+    }
+
     public function testRecipientWithoutDeliveryIdentityUsesRawPath(): void
     {
         $message = $this->message();
