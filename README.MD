@@ -376,9 +376,9 @@ part of these numbers.
 | User CPU time                      | 5.4 s       | 8.5 s      |
 | Peak memory of the sending process | 136 MB      | 631 MB     |
 
-With `ratelimit=80` and 100 ms of added latency per request (404 contacts), one process reached 57 recipients/s with
-`bulk=auto` and 27 recipients/s with `bulk=off`. That run still sent 50 recipients per request; with the default
-`bulk_concurrency=2`, requests now carry at most 40 recipients at `ratelimit=80`.
+With `ratelimit=80` and 100 ms of added latency per request (404 contacts), one process reached 51 recipients/s with
+`bulk=auto` (11 requests of at most 40 recipients, the cap for `ratelimit=80` with the default `bulk_concurrency=2`)
+and 30 recipients/s with `bulk=off` (404 requests).
 
 ### Testing
 
