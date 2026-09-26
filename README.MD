@@ -409,6 +409,7 @@ and 30 recipients/s with `bulk=off` (404 requests).
 
 ### Testing
 
+- [docs/SES_BULK_FLOW.md](docs/SES_BULK_FLOW.md): diagrams of the send path and of the life of an outbox row.
 - [docs/SES_E2E_TESTING.md](docs/SES_E2E_TESTING.md): offline, SES sandbox and production canary tests, with what
   each of them proves.
 - [Tests/E2E/offline/README.md](Tests/E2E/offline/README.md): the scripted offline harness, including queued sending
