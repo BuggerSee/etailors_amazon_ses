@@ -76,6 +76,24 @@ class DeliveryStoreTest extends TestCase
         self::assertSame(3, (int) $db->fetchOne('SELECT COUNT(*) FROM ses_bulk_deliveries'));
     }
 
+    public function testAcceptedRetryClearsEarlierFailureReason(): void
+    {
+        $em = self::manager();
+        $store = new DeliveryStore($em);
+        $store->install();
+        $id = $store->enqueue(self::delivery(), 'scope');
+        $store->complete($store->claim($id, 'scope', 'worker-a'), 'retry', 'TRANSIENT_FAILURE');
+        self::assertSame('TRANSIENT_FAILURE', $store->summary(42)['recipients'][0]['reason']);
+        $em->getConnection()->executeStatement('UPDATE ses_bulk_deliveries SET next_attempt = 0');
+        $retried = $store->claim($id, 'scope', 'worker-b');
+        self::assertNotNull($retried);
+        $store->complete($retried, 'accepted', '', 'ses-id');
+        $recipients = $store->summary(42)['recipients'];
+        self::assertCount(1, $recipients);
+        self::assertSame('accepted', $recipients[0]['state']);
+        self::assertSame('', $recipients[0]['reason']);
+    }
+
     public function testExpiredClaimsAreUnknownNotRetryable(): void
     {
         $em = self::manager();

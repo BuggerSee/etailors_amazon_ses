@@ -117,9 +117,11 @@ final class DeliveryStore
             $state = 'rejected';
             $reason = 'retry_exhausted:'.$reason;
         }
+        // Accepted on a retry drops the earlier attempt's failure reason. Before the first attempt the reason can only be
+        // the raw-fallback reason from enqueue(), which stays.
         $this->entityManager->getConnection()->executeStatement(
-            "UPDATE {$this->deliveries} SET state = ?, reason = CASE WHEN ? = '' THEN reason ELSE ? END, message_id = CASE WHEN ? = '' THEN message_id ELSE ? END, next_attempt = ?, updated_at = ?, synced = 0 WHERE id = ? AND claim = ? AND state = 'sending'",
-            [$state, $reason, substr($reason, 0, 128), $messageId, $messageId, time() + min(3600, 30 * (2 ** (int) $row['attempts'])), time(), $row['id'], $row['claim']]
+            "UPDATE {$this->deliveries} SET state = ?, reason = CASE WHEN ? = 'accepted' AND attempts > 1 THEN '' WHEN ? = '' THEN reason ELSE ? END, message_id = CASE WHEN ? = '' THEN message_id ELSE ? END, next_attempt = ?, updated_at = ?, synced = 0 WHERE id = ? AND claim = ? AND state = 'sending'",
+            [$state, $state, $reason, substr($reason, 0, 128), $messageId, $messageId, time() + min(3600, 30 * (2 ** (int) $row['attempts'])), time(), $row['id'], $row['claim']]
         );
     }
 

@@ -73,7 +73,7 @@ printf("log: %d bulk requests, %d raw requests for email %d, %d account calls\n"
 
 // ---- outbox ------------------------------------------------------------------------------------
 $deliveries = $pdo->query(sprintf(
-    "SELECT d.id, d.tracking_hash, d.state, d.event, d.reason, d.message_id, d.attempts, d.entry, c.operation FROM %sses_bulk_deliveries d JOIN %sses_bulk_contents c ON c.id = d.content_id WHERE d.email_id = %d",
+    "SELECT d.id, d.tracking_hash, d.state, d.event, d.reason, d.message_id, d.attempts, d.entry, d.claim, c.operation FROM %sses_bulk_deliveries d JOIN %sses_bulk_contents c ON c.id = d.content_id WHERE d.email_id = %d",
     $prefix, $prefix, $emailId
 ))->fetchAll(PDO::FETCH_ASSOC);
 $byId = array_column($deliveries, null, 'id');
@@ -82,6 +82,21 @@ $ops = array_count_values(array_column($deliveries, 'operation'));
 printf("outbox: %d deliveries, states=%s, operations=%s\n", count($deliveries), json_encode($states), json_encode($ops));
 $check(count($deliveries) === count($seeded), 'one outbox row per seeded recipient', sprintf('%d rows vs %d seeded', count($deliveries), count($seeded)));
 $check(($ops['bulk'] ?? 0) === count($deliveries), 'every recipient went through the shared-template path', json_encode($ops));
+// Every claim adds an attempt and a failed attempt is due again 60 s later at the earliest, so before any retry run a
+// row with attempts > 1 was claimed twice, e.g. by two Messenger workers handling the same message.
+if (!$afterRetry) {
+    $reclaimed = count(array_filter($deliveries, static fn (array $row): bool => (int) $row['attempts'] > 1));
+    $check(0 === $reclaimed, 'no outbox row was claimed more than once before the retry runs', "$reclaimed rows with attempts > 1");
+}
+// BulkSender claims with one owner token per send() call (one per Messenger message) and complete() keeps it, so the
+// claim column shows which call last submitted each row.
+$owners = array_count_values(array_filter(array_column($deliveries, 'claim'), static fn (string $claim): bool => '' !== $claim));
+arsort($owners);
+if ([] === $owners) {
+    echo "claims: no claim owner recorded on the outbox rows, skipped\n";
+} else {
+    printf("claims: %d owner(s), rows per owner: %s\n", count($owners), implode(', ', array_map(static fn (int|string $owner, int $rows): string => substr((string) $owner, 0, 8)."…=$rows", array_keys($owners), $owners)));
+}
 
 // ---- bulk entries versus recipients ----------------------------------------------------------
 // Every logged entry is one submission: a recipient's first comes from the send, later ones from retry runs.

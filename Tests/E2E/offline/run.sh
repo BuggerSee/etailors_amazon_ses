@@ -3,7 +3,7 @@
 # (Tests/E2E/fake-ses-server.php) instead of AWS. See README.md next to this script.
 #
 #   run.sh prepare | fake-up | fake-down | seed [count] [domain] | send | status | retry [--now] | sync
-#          | verify [--after-retry] [--after-sync] | all [count] [domain]
+#          | verify [--after-retry] [--after-sync] | all [count] [domain] | async | all-async [count] [domain]
 #
 # Environment:
 #   PHP_BIN        PHP binary for Mautic and the fake server (default: php)
@@ -15,6 +15,7 @@
 #   FAKE_SES_RATE  MaxSendRate reported by the fake account endpoint (default: 80)
 #   STATE          seed state (email id, contacts) read by send/status/retry/verify (default: ses-e2e-state.json next to FAKE_LOG)
 #   BATCH          contacts per mautic:broadcasts:send batch (default: 100)
+#   WORKERS        parallel messenger:consume email workers started by async (default: 2)
 # Give every Mautic install its own FAKE_PORT, FAKE_LOG and STATE.
 set -euo pipefail
 
@@ -28,6 +29,7 @@ mkdir -p "$WORK_DIR"
 FAKE_PID="$WORK_DIR/fake-ses-$FAKE_PORT.pid"
 STATE="${STATE:-$WORK_DIR/ses-e2e-state.json}"
 BATCH="${BATCH:-100}"
+WORKERS="${WORKERS:-2}"
 
 php() { "$PHP_BIN" -d memory_limit=1G -d max_execution_time=0 "$@"; }
 console() { (cd "$MAUTIC_ROOT" && php bin/console "$@"); }
@@ -76,10 +78,64 @@ retry() {
   console mautic:ses:bulk retry --limit=1000
 }
 
+# Rewrites messenger_dsn_email in local.php (re-exported with var_export, so comments in it are lost) and clears the cache.
+messenger_dsn() {
+  "$PHP_BIN" -r '$f = $argv[1]; require $f; $parameters["messenger_dsn_email"] = $argv[2]; file_put_contents($f, "<?php\n\$parameters = ".var_export($parameters, true).";\n");' "$MAUTIC_ROOT/config/local.php" "$1"
+  console cache:clear >/dev/null
+  echo "messenger_dsn_email is $1"
+}
+
+# Messages waiting in the Doctrine queue of the email transport. Symfony 5.4 and 6.4 acknowledge on MySQL by setting
+# delivered_at to 9999-12-31 and delete those rows only on a later fetch; Symfony 7 deletes them at once.
+queued() {
+  "$PHP_BIN" -- "$MAUTIC_ROOT/config/local.php" <<'PHP'
+<?php
+require $argv[1];
+$db = new PDO(sprintf('mysql:host=%s;port=%s;dbname=%s', $parameters['db_host'], ($parameters['db_port'] ?? null) ?: 3306, $parameters['db_name']), $parameters['db_user'], $parameters['db_password'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+if (!$db->query("SHOW TABLES LIKE 'messenger_messages'")->fetchColumn()) {
+    echo 0;
+    exit;
+}
+echo $db->query("SELECT COUNT(*) FROM messenger_messages WHERE queue_name = 'default' AND (delivered_at IS NULL OR delivered_at < '9999-01-01')")->fetchColumn();
+PHP
+}
+
+# Production path: mautic:broadcasts:send only queues on Doctrine, then WORKERS messenger:consume processes deserialise
+# the messages and call the transport in parallel, sharing the token bucket and the outbox. The trap restores sync://.
+async() (
+  local workers='' queue limit i pid failed=0
+  trap 'kill $workers 2>/dev/null || true; messenger_dsn sync://' EXIT
+  trap 'exit 130' INT TERM
+  messenger_dsn doctrine://default
+  run send
+  queue="$(queued)"
+  if [ "$queue" -eq 0 ]; then echo "nothing was queued: seed a new email, or check that messenger_dsn_email in $MAUTIC_ROOT/config/local.php takes effect" >&2; return 1; fi
+  # Each worker stops after its share of the queue, so the run ends without waiting for the time limit.
+  limit=$(( (queue + WORKERS - 1) / WORKERS ))
+  echo "$queue message(s) queued; starting $WORKERS worker(s) with --limit=$limit --time-limit=120, logs in $WORK_DIR/messenger-worker-N.log"
+  SECONDS=0
+  for i in $(seq 1 "$WORKERS"); do
+    # exec makes $! the worker's own pid, so the trap can stop it: bash starts background jobs with Ctrl-C ignored.
+    (cd "$MAUTIC_ROOT" && exec "$PHP_BIN" -d memory_limit=1G -d max_execution_time=0 bin/console messenger:consume email --time-limit=120 --limit="$limit" -vv) >"$WORK_DIR/messenger-worker-$i.log" 2>&1 &
+    workers="$workers $!"
+  done
+  i=0
+  for pid in $workers; do
+    i=$((i + 1))
+    if wait "$pid"; then echo "worker $i finished"; else echo "worker $i failed with status $?" >&2; failed=1; fi
+  done
+  workers=''
+  queue="$(queued)"
+  echo "workers done after ${SECONDS}s, $queue message(s) left in the queue"
+  if [ "$failed" -ne 0 ] || [ "$queue" -ne 0 ]; then echo "see the worker logs in $WORK_DIR" >&2; return 1; fi
+  run status
+  run verify
+)
+
 run() {
   local action="${1:-all}" id
   case "$action" in
-    prepare|seed|send|status|retry|sync|verify|all) : "${MAUTIC_ROOT:?set MAUTIC_ROOT to the Mautic project root}" ;;
+    prepare|seed|send|status|retry|sync|verify|all|async|all-async) : "${MAUTIC_ROOT:?set MAUTIC_ROOT to the Mautic project root}" ;;
   esac
   case "$action" in
     fake-up)   fake_up ;;
@@ -91,6 +147,7 @@ run() {
     retry)     retry "${2:-}" ;;
     sync)      console mautic:ses:bulk sync-stats ;;
     verify)    shift; php "$HERE/verify.php" "$MAUTIC_ROOT" "$STATE" "$FAKE_LOG" "$@" ;;
+    async)     async ;;
     all)
       run prepare
       fake_up
@@ -98,6 +155,17 @@ run() {
       run send
       run status
       run verify
+      retry --now
+      run status
+      run verify --after-retry
+      run sync
+      run verify --after-retry --after-sync
+      ;;
+    all-async)
+      run prepare
+      fake_up
+      run seed "${2:-100}" "${3:-example.test}"
+      run async
       retry --now
       run status
       run verify --after-retry

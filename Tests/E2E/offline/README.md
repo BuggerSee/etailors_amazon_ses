@@ -6,7 +6,7 @@ every step against the fake server's request log, the outbox tables and Mautic's
 
 | File        | Purpose                                                                                                     |
 |-------------|-------------------------------------------------------------------------------------------------------------|
-| `run.sh`    | Runner: fake server, seeding, sending, `mautic:ses:bulk` commands, verification.                            |
+| `run.sh`    | Runner: fake server, seeding, sending (inline or through Messenger workers), `mautic:ses:bulk` commands, verification. |
 | `seed.php`  | Creates contacts, a segment and a published segment email through Mautic's own models (no HTTP, no API).    |
 | `verify.php`| Cross-checks the fake SES log, `ses_bulk_deliveries`/`ses_bulk_contents` and `email_stats`; exits non-zero on any failed check. |
 | `bench.sh`  | Times `bulk=auto` against `bulk=off` for the same seed and appends the numbers to `bench-results.tsv`.      |
@@ -22,7 +22,9 @@ every step against the fake server's request log, the outbox tables and Mautic's
   `composer require aws/aws-php-sns-message-validator:^1.10 aws/aws-sdk-php:^3.325.1`).
 - The outbox tables. `run.sh prepare` creates them with `bin/console mautic:ses:bulk install`.
 - Synchronous email sending (`'messenger_dsn_email' => 'sync://'` in `config/local.php`). With a queued transport,
-  `send` only queues the messages; run `bin/console messenger:consume email` before `status` and `verify`.
+  `send` only queues the messages; run `bin/console messenger:consume email` before `status` and `verify`, or use
+  `run.sh async`, which switches to a Doctrine queue and back by itself (see
+  [Queued sending with parallel workers](#queued-sending-with-parallel-workers)).
 - The mailer DSN below.
 
 ### Mailer DSN
@@ -88,6 +90,7 @@ The port in `endpoint` must equal `FAKE_PORT`. Clear the cache after every DSN c
 | `FAKE_SES_RATE` | `80`                                                      | `MaxSendRate` reported by the fake account endpoint.                            |
 | `STATE`         | `ses-e2e-state.json` next to `FAKE_LOG`                   | Seed state (`stamp`, `segment_id`, `email_id`, `contact_ids`, `emails`).        |
 | `BATCH`         | `100` (`500` in `bench.sh`)                               | Contacts per `mautic:broadcasts:send` batch.                                    |
+| `WORKERS`       | `2`                                                       | `messenger:consume email` processes that `async` runs in parallel.              |
 
 `seed.php` also reads `SEED_HTML_FILE` (send your own HTML instead of the built-in fixture; its plain text is derived
 by stripping tags), `SEED_NAME` and `SEED_SUBJECT`.
@@ -122,11 +125,58 @@ Tests/E2E/offline/run.sh all 100
 `fake-down` stops the fake server (also the one `bench.sh` starts). Each step can be run on its own, for example
 `run.sh seed 20`, `run.sh send`, `run.sh verify`.
 
+`all-async [count] [domain]` runs the same steps, with `async` in place of `send`, `status` and `verify`:
+
+```
+WORKERS=2 Tests/E2E/offline/run.sh all-async 120
+```
+
 The fake server fails bulk entries by the exact local part of the recipient: `transient@` returns
 `TRANSIENT_FAILURE`, `throttled@` returns `ACCOUNT_THROTTLED`, `rejected@` returns `MESSAGE_REJECTED`, and `http500@`
 fails the whole request with HTTP 500. `flaky@` returns `TRANSIENT_FAILURE` for the first request that contains that
 address and `SUCCESS` afterwards; the addresses already seen are kept in `<FAKE_LOG>.state.json`. The run stamp goes
 into the domain so these local parts stay exact and every run gets fresh addresses.
+
+### Queued sending with parallel workers
+
+In production, `mautic:broadcasts:send` only queues the email on Symfony Messenger, and several
+`bin/console messenger:consume email` workers call the transport. Each worker deserialises the queued `MauticMessage`
+(recipient metadata with `hashId`, `emailId` and `tokens` included) before `doSend()` runs, and all workers on a host
+share the token-bucket file in Mautic's cache directory. `run.sh async` reproduces this on one machine:
+
+1. Sets `messenger_dsn_email` to `doctrine://default` in `<MAUTIC_ROOT>/config/local.php` (re-exported with
+   `var_export` like `bench.sh` does, so comments in it are lost) and clears the cache. `default` is the Doctrine
+   connection; Symfony creates the `messenger_messages` table (without Mautic's table prefix) on the first send.
+2. Runs `send`, which now only queues: one Messenger message per `mautic:broadcasts:send` batch (`BATCH`), each
+   carrying its recipients. The 124 recipients of `all-async 120` become two messages with the default `BATCH=100`.
+3. Counts the queued messages and starts `WORKERS` processes of
+   `bin/console messenger:consume email --time-limit=120 --limit=<n> -vv` at once, with `<n>` = queued messages divided
+   by `WORKERS`, rounded up, so each worker exits after its share instead of idling until the time limit. Their output
+   goes to `messenger-worker-<i>.log` next to `FAKE_LOG`.
+4. Waits for the workers, fails when one of them failed or messages are left in the queue, then runs `status` and
+   `verify`.
+5. Restores `messenger_dsn_email` to `sync://` and clears the cache in an exit trap, so this also happens when a step
+   fails or the run is interrupted (the trap stops workers that are still running).
+
+A worker takes at most `<n>` messages. When the queue does not divide evenly (three messages for two workers), one
+worker keeps polling until the 120 s time limit. A message whose handler throws is queued again by Mautic's Messenger
+retry strategy and can stay behind; `async` then reports the messages left, and `bin/console messenger:consume email`
+drains them.
+
+Mautic 5, 6 and 7 agree on the parts `async` relies on: the parameter is `messenger_dsn_email`, the transport is named
+`email` (Mautic routes `SendEmailMessage` to it), and `--time-limit` and `--limit` are checked after each message and
+after each empty poll (`--sleep`, default 1 s), so an idle worker stops about a second after its time limit. In all
+three, `-vv` prints only the worker banner, because Mautic's production Monolog configuration has no console handler;
+the claim owners that `verify` prints show how the recipients were split instead. What differs:
+
+|                                        | Mautic 5 (5.2)   | Mautic 6 (6.0.9)                                                       | Mautic 7 (7.2.1)    |
+|----------------------------------------|------------------|------------------------------------------------------------------------|---------------------|
+| Symfony Messenger                      | 5.4              | 6.4                                                                    | 7.4                 |
+| Acknowledged message on MySQL/MariaDB  | as Mautic 6      | Row kept with `delivered_at = '9999-12-31 23:59:59'`, deleted by a later fetch | Row deleted at once |
+
+`async` counts the queue without the `9999-12-31` rows, so its check works on all three. Mautic 6 and 7 were run
+locally; the Mautic 5 column comes from the 5.2 sources (`app/config/config.php`, `composer.lock`, Symfony 5.4's
+Doctrine transport) and has not been run.
 
 ### Retry timing and the `--now` shortcut
 
@@ -155,6 +205,7 @@ email, prints `PASS`/`FAIL` per check and exits 1 when any check fails (2 on bad
 |----------------------------------------------------------------------------|---------------------------------------------------------------------------------|
 | one outbox row per seeded recipient                                        | Every recipient was persisted before submission.                                |
 | every recipient went through the shared-template path                      | No recipient fell back to raw sending (`operation = bulk`).                     |
+| no outbox row was claimed more than once before the retry runs (no flag only) | No row has `attempts > 1` right after the send. Each claim adds an attempt and a failed row is due again 60 s later at the earliest, so after `async` this proves that two workers never claimed the same delivery. |
 | bulk request N carries an inline template                                  | `SendBulkEmail` uses `DefaultContent.Template.TemplateContent` with subject and HTML. |
 | bulk request N has <=50 entries and one result per entry                   | Batches respect the SES entry limit.                                            |
 | entry N renders and reconciles                                             | Per submission: the verifier substitutes `{{var}}` from the entry's replacement data and finds the recipient's address and tracking hash in the HTML, no unreplaced Mautic token (`{contactfield=…}`, `{unsubscribe_text}`, `{webview_text}`, `{tracking_pixel}`, `{trackable=…}`, `{leadfield=…}`), no leftover `{{`/missing variable, a `List-Unsubscribe` header with the recipient's hash, the `mautic_delivery_id` and `X-EMAIL-ID` tags, the fake status expected for that local part and attempt, the SES `MessageId` stored on accepted rows, and resubmission only after `TRANSIENT_FAILURE`/`ACCOUNT_THROTTLED`. At a recipient's latest submission it also checks the outbox state (and, for an exhausted retry, the reason `retry_exhausted:<status>`) and that the outbox attempt count equals the number of logged submissions. |
@@ -164,6 +215,12 @@ email, prints `PASS`/`FAIL` per check and exits 1 when any check fails (2 on bad
 | Mautic recorded one email_stats row per recipient / every outbox row maps to an email_stats row | Mautic's statistics and the outbox agree by tracking hash.     |
 | sync-stats flagged exactly the rejected recipients as failed (`--after-sync`) | `email_stats.is_failed` count equals the number of `rejected` outbox rows.    |
 | no do-not-contact entries were created by transport failures               | Transport failures never mark the seeded contacts do-not-contact.               |
+
+`verify` also prints `claims: <n> owner(s), rows per owner: …`, the number of outbox rows per value of the `claim`
+column. `BulkSender` claims with one owner token per `send()` call, i.e. per Messenger message, and keeps it on the row,
+so after `async` it shows how the recipients were split between the handled messages (100 and 24 for `all-async 120`);
+after a retry run the retried rows carry the retry run's owner. Rows without an owner are left out, and the line says
+`skipped` when no row has one.
 
 Expected outbox states per stage:
 
@@ -183,7 +240,9 @@ Expected outbox states per stage:
 - SES limits and behaviour: request size limits, quotas, real throttling, account-level suppression, credentials,
   IAM policies and regions.
 - Raw sending beyond counting: raw requests are only counted, their MIME content is not checked.
-- Queued sending: with `sync://` the transport runs inside `mautic:broadcasts:send`, not in a Messenger worker.
+- Queued sending beyond one host and one transport: `async` covers the Doctrine transport with workers on one
+  machine. Other transports (AMQP, Redis), workers on several hosts (each host has its own token-bucket file) and
+  Messenger's failure transport are not exercised, nor is a worker that dies during a request (its rows turn `unknown`).
 
 ## Benchmark
 
