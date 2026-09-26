@@ -20,8 +20,9 @@ file lists where each part lives, the limits that decide eligibility and what is
 ## Invariants
 
 - A delivery is identified by `sha256(scope | email ID | tracking hash | recipient)`, where the scope is the SES region
-  and access key. A re-delivered Messenger message maps to the same rows and uses their saved content and state before checking
-  current template eligibility; edits to the Email entity cannot send a terminal recipient through raw fallback.
+  alone, so rotating the access key keeps every row reachable. A re-delivered Messenger message maps to the same rows
+  and uses their saved content and state before checking current template eligibility; edits to the Email entity
+  cannot send a terminal recipient through raw fallback.
 - Every recipient of a message is recorded in one transaction before the first request. A failure up to the commit
   reaches Mautic and leaves nothing behind; a failure after it is logged and left to the outbox, because Mautic would
   otherwise resend the message under new tracking hashes.

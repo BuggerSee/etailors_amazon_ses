@@ -27,6 +27,7 @@ return static function (ContainerConfigurator $configurator) {
     $excludes = [
         'Mailer/Transport/AmazonSesTransport.php',
         'Mailer/Bulk/IneligibleMessage.php',
+        'Helper/SnsCertificateUnavailable.php',
     ];
 
     $services->load('MauticPlugin\\AmazonSesBundle\\', '../')

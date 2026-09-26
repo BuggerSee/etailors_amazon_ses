@@ -42,7 +42,18 @@ class AmazonSesTransportBulkTest extends TestCase
 
     protected function setUp(): void
     {
-        $this->client = BulkSenderTest::client(function ($command) {
+        $this->client = $this->acceptingClient();
+        $this->em = DeliveryStoreTest::manager();
+        $this->store = new DeliveryStore($this->em);
+        $this->store->install();
+        $this->cache = sys_get_temp_dir().'/ses-transport-test-'.bin2hex(random_bytes(8));
+        mkdir($this->cache);
+    }
+
+    /** SES accepts every request, as the same account whatever the access key. */
+    private function acceptingClient(string $accessKeyId = 'test'): SesV2Client
+    {
+        return BulkSenderTest::client(function ($command) {
             $this->calls[] = [$command->getName(), $command->toArray()];
             if ('SendBulkEmail' !== $command->getName()) {
                 return Create::promiseFor(new Result(['MessageId' => 'raw-'.count($this->calls)]));
@@ -53,12 +64,7 @@ class AmazonSesTransportBulkTest extends TestCase
             }
 
             return Create::promiseFor(new Result(['BulkEmailEntryResults' => $results]));
-        });
-        $this->em = DeliveryStoreTest::manager();
-        $this->store = new DeliveryStore($this->em);
-        $this->store->install();
-        $this->cache = sys_get_temp_dir().'/ses-transport-test-'.bin2hex(random_bytes(8));
-        mkdir($this->cache);
+        }, $accessKeyId);
     }
 
     protected function tearDown(): void
@@ -188,6 +194,25 @@ class AmazonSesTransportBulkTest extends TestCase
         $entries = $this->calls[0][1]['BulkEmailEntries'];
         self::assertCount(1, $entries);
         self::assertSame($due, array_column($entries[0]['ReplacementTags'], 'Value', 'Name')['mautic_delivery_id']);
+    }
+
+    public function testRotatedAccessKeyKeepsTheOutbox(): void
+    {
+        $this->client = $this->acceptingClient('AKIAOLD');
+        $queued = serialize($this->message());
+        $this->transport()->send(unserialize($queued));
+        $waiting = $this->store->enqueue(DeliveryStoreTest::delivery('waiting'), BulkSender::scope($this->client));
+        $this->em->getConnection()->update('ses_bulk_deliveries', ['state' => 'retry', 'attempts' => 1, 'next_attempt' => 0], ['id' => $waiting]);
+
+        // A routine key rotation while the queue message can still be redelivered (messenger:failed:retry).
+        $this->client = $this->acceptingClient('AKIANEW');
+        $this->transport()->send(unserialize($queued));
+        self::assertSame(['SendBulkEmail'], array_column($this->calls, 0));
+        self::assertSame(1, $this->transport()->retryBulk());
+
+        self::assertSame(['SendBulkEmail', 'SendBulkEmail'], array_column($this->calls, 0));
+        self::assertSame($waiting, array_column($this->calls[1][1]['BulkEmailEntries'][0]['ReplacementTags'], 'Value', 'Name')['mautic_delivery_id']);
+        self::assertSame(3, (int) $this->em->getConnection()->fetchOne("SELECT COUNT(*) FROM ses_bulk_deliveries WHERE state = 'accepted'"));
     }
 
     public function testRetryBulkSkipsRawDeliveriesMadeFinalElsewhereSinceTheyWereListed(): void
@@ -376,6 +401,40 @@ class AmazonSesTransportBulkTest extends TestCase
             'same feedback address' => ['Bounces@example.test', ['SendBulkEmail']],
             // Which of the two SES would use is not documented, so the email is sent as before.
             'different feedback address' => ['feedback@example.test', ['SendEmail', 'SendEmail']],
+        ];
+    }
+
+    /**
+     * @dataProvider returnPathSends
+     */
+    public function testReturnPathDoesNotReplaceTheFromAddress(array $tokensB, bool $attachment, array $operations, ?string $fromName, string $name): void
+    {
+        // Mautic sets Return-Path from mailer_return_path, which Symfony's envelope then uses as the sender. An email
+        // without its own From address keeps the one Mautic resolved.
+        $message = $this->message($tokensB)->returnPath('bounces@example.test');
+        if ($attachment) {
+            $message->attach('data', 'file.txt');
+        }
+        $this->transport(entity: (new \Mautic\EmailBundle\Entity\Email())->setFromName($fromName))->send($message);
+
+        self::assertSame($operations, array_column($this->calls, 0));
+        foreach ($this->calls as [$operation, $request]) {
+            self::assertSame('"'.$name.'" <news@example.test>', $request['FromEmailAddress']);
+            if ('SendEmail' === $operation) {
+                self::assertMatchesRegularExpression('/^From: '.$name.' <news@example\.test>\r?$/m', $request['Content']['Raw']['Data']);
+            }
+        }
+    }
+
+    public static function returnPathSends(): array
+    {
+        $delimiters = ['{unsubscribe_text}' => '<a href="https://example.test/u/b">{{Unsubscribe}}</a>'];
+
+        return [
+            'shared template' => [[], false, ['SendBulkEmail'], null, 'Newsroom'],
+            'raw fallback of one recipient' => [$delimiters, false, ['SendBulkEmail', 'SendEmail'], null, 'Newsroom'],
+            'raw email' => [[], true, ['SendEmail', 'SendEmail'], null, 'Newsroom'],
+            'From name of the email' => [[], false, ['SendBulkEmail'], 'Editor', 'Editor'],
         ];
     }
 

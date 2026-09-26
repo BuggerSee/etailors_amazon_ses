@@ -139,7 +139,7 @@ retry timing with `retry --now`, the async mode and `bench.sh`. The manual equiv
     ```
 
     It prints `Processed up to 2 due recipients. Inspect status for their outcomes.` and reconciles statistics as
-    `sync-stats` does. `retry` handles the due rows of every email sent with the same region and access key, so rows
+    `sync-stats` does. `retry` handles the due rows of every email sent in the same SES region, so rows
     left over from earlier test emails raise that count. `status` now shows `flaky@` accepted and `transient@` still
     in `retry` after its second attempt:
 

@@ -18,6 +18,9 @@ use MauticPlugin\AmazonSesBundle\Tests\Unit\Mailer\Bulk\DeliveryStoreTest;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\NullLogger;
+use Symfony\Component\Cache\Adapter\ArrayAdapter;
+use Symfony\Component\HttpClient\MockHttpClient;
+use Symfony\Component\HttpClient\Response\MockResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 use Symfony\Contracts\Translation\TranslatorInterface;
@@ -53,8 +56,9 @@ class CallbackSubscriberTest extends TestCase
             $this->createMock(ContactFinder::class),
             $this->dncModel,
             $this->createMock(LeadModel::class),
-            // SnsWebhookAuthenticator is final, so the real one is used; no test payload carries an SNS signature.
-            new SnsWebhookAuthenticator(),
+            // SnsWebhookAuthenticator is final, so the real one is used; no test payload carries a valid SNS signature,
+            // and the signing certificate cannot be downloaded.
+            new SnsWebhookAuthenticator(new MockHttpClient(static fn (): MockResponse => new MockResponse('', ['error' => 'Network is unreachable'])), new ArrayAdapter()),
             $translator,
             new NullLogger(),
             $this->store,
@@ -117,6 +121,23 @@ class CallbackSubscriberTest extends TestCase
         $this->subscriber->processCallbackRequest($event);
 
         self::assertSame(403, $event->getResponse()?->getStatusCode());
+        self::assertSame('', $this->store->summary()['recipients'][0]['event']);
+    }
+
+    public function testUnavailableSigningCertificateAsksSnsToRetry(): void
+    {
+        $this->parameters->method('get')->with('mailer_dsn')->willReturn('mautic+ses+api://key:secret@default?region=eu-central-1&sns_topic_arn='.self::TOPIC);
+        $id = $this->store->enqueue(DeliveryStoreTest::delivery(), 'scope');
+        $payload = [
+            'TopicArn' => self::TOPIC, 'MessageId' => 'sns-id', 'Timestamp' => '2026-09-20T00:00:00Z', 'SignatureVersion' => '2',
+            'Signature' => base64_encode('signature'), 'SigningCertURL' => 'https://sns.eu-central-1.amazonaws.com/SimpleNotificationService-test.pem',
+        ] + self::notification(['eventType' => 'Bounce', 'mail' => ['messageId' => 'ses-id', 'tags' => ['mautic_delivery_id' => [$id]]]]);
+        $event = new TransportWebhookEvent(Request::create('/mailer/callback', 'POST', [], [], [], [], json_encode($payload, JSON_THROW_ON_ERROR)));
+
+        $this->subscriber->processCallbackRequest($event);
+
+        // SNS retries 5xx answers only; a 403 would drop the bounce for good.
+        self::assertSame(503, $event->getResponse()?->getStatusCode());
         self::assertSame('', $this->store->summary()['recipients'][0]['event']);
     }
 

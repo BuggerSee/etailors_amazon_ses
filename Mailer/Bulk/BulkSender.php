@@ -19,9 +19,13 @@ final class BulkSender
     {
     }
 
+    /**
+     * The outbox partition of the configured SES region. The access key is left out: rotating it must neither hide saved
+     * recipients from the retry command nor let a replayed queue message send accepted recipients again.
+     */
     public static function scope(SesV2Client $client): string
     {
-        return hash('sha256', $client->getRegion().'|'.$client->getCredentials()->wait()->getAccessKeyId());
+        return hash('sha256', $client->getRegion());
     }
 
     public static function assertSupported(SesV2Client $client): void

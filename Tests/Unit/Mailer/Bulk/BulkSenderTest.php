@@ -286,9 +286,9 @@ class BulkSenderTest extends TestCase
         self::assertSame([['accepted', 3]], array_map(static fn (array $row): array => [$row['state'], (int) $row['recipients']], $store->summary()['recipients']));
     }
 
-    public static function client(callable $handler): SesV2Client
+    public static function client(callable $handler, string $accessKeyId = 'test'): SesV2Client
     {
-        return new SesV2Client(['version' => 'latest', 'region' => 'eu-central-1', 'credentials' => ['key' => 'test', 'secret' => 'test'], 'handler' => $handler]);
+        return new SesV2Client(['version' => 'latest', 'region' => 'eu-central-1', 'credentials' => ['key' => $accessKeyId, 'secret' => 'test'], 'handler' => $handler]);
     }
 
     /** @return list<int> the number of resolved requests when each request reached SES */

@@ -193,8 +193,8 @@ until 60 s have passed. `run.sh retry --now` skips the wait: it runs
 `verify --after-retry` requires `retry` for them while fewer than four submissions are logged and `rejected` with
 reason `retry_exhausted:<status>` (the status the fake server returned) once four are.
 
-`mautic:ses:bulk retry` processes the due rows of every email sent with the same region and access key, not only the
-seeded one, and it reconciles failed statistics as `sync-stats` does.
+`mautic:ses:bulk retry` processes the due rows of every email sent in the same SES region, not only the seeded one,
+and it reconciles failed statistics as `sync-stats` does.
 
 ## What `verify` checks
 

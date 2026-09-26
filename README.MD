@@ -174,7 +174,11 @@ To receive feedback from Amazon SES regarding bounces and complaints, you need t
 
 4. Ensure your topic sends notifications for bounces, complaints, and delivery status.
 5. Ensure the exact topic ARN is configured as `sns_topic_arn` in the mailer DSN.
-   The plugin verifies the AWS signature and topic before processing any callback.
+   The plugin verifies the AWS signature and topic before processing any callback. A callback from another topic or
+   with an invalid signature is answered `403` and logged at `warning` level with the reason. To check the signature,
+   Mautic downloads the SNS signing certificate over HTTPS from `sns.<region>.amazonaws.com` (5-second timeout) and
+   caches it for an hour; if the download fails, the callback is answered `503`, which makes SNS deliver it again
+   later, and the failure is logged at `error` level.
 6. For classic identity-based SNS notifications, enable **Include original headers** for bounce and complaint notifications on the verified SES identity. Mautic uses the `X-EMAIL-ID` header to attribute feedback to the email statistics. Configuration-set event publishing can use the `X-EMAIL-ID` message tag added by this plugin instead.
 7. Test your callback configuration by sending test emails and reviewing Mautic logs to verify feedback is processed correctly.
 
@@ -251,8 +255,8 @@ carry a tracking hash and an email ID, as the recipients of segment emails do. E
 For recipients already in the outbox, a replay uses their saved content and state, even if the Email entity's headers
 have since changed. Only due pending/retry recipients can be claimed again; terminal recipients stay final.
 For a fresh message, the plugin checks the first recipient. If that recipient cannot use a shared template, the whole
-email takes the raw path of `bulk=off` unchanged (raw MIME per recipient, micro-batches, inline retries after 1, 2
-and 4 seconds) and nothing is written to the outbox. The transport logs
+email takes the raw path of `bulk=off` (raw MIME per recipient, micro-batches, inline retries after 1, 2 and 4
+seconds; only the From address can differ, see below) and nothing is written to the outbox. The transport logs
 `SES raw sending: message is not eligible for shared templates.` with the reason at `info` level, which Mautic's
 production log configuration does not write to `var/logs`.
 
@@ -278,6 +282,11 @@ passes the address as the request's `FeedbackForwardingEmailAddress` instead. A 
 an empty value for a recipient is left out for that recipient, as Mautic does for custom headers itself; SES refuses
 empty header values.
 
+When the email itself sets no From address or name, `bulk=auto` keeps those of the From header Mautic resolved (the
+default sender or the contact owner), on the raw path too. `bulk=off` behaves as in 1.0.41 and takes them from the
+envelope sender, which is the `Return-Path` address whenever one is set, so such emails are then sent from the bounce
+address.
+
 When the first recipient passes and a later one does not, only that recipient is sent raw. The typical reasons are
 per recipient: `replacement_data_size` (replacement data over 262,144 bytes), `request_size` (a request with this
 recipient alone would exceed 1,000,000 bytes), `header_size_or_folding` (a header name over 126 bytes, or a value
@@ -301,13 +310,20 @@ php bin/console mautic:ses:bulk prune [--older-than=DAYS] [--limit=N]
 |--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `install`    | Creates the outbox tables that do not exist yet. Safe to run again.                                                                                                                                                                                                                                                                                         |
 | `status`     | Recipients per mode (`bulk` or `raw`), submission state, SES event and reason, with their attempts, plus the requests and estimated request bytes per mode. `--email-id` limits it to one Mautic email; `--json` prints the same data as JSON. Only recipients recorded in the outbox are counted.                                                          |
-| `retry`      | Turns stale claims into `unknown`, resubmits due `pending` and `retry` rows, then reconciles statistics like `sync-stats`. It reads `mailer_dsn`, requires `bulk=auto` and handles the rows of every email sent with the same region and access key.                                                                                                        |
+| `retry`      | Turns stale claims into `unknown`, resubmits due `pending` and `retry` rows, then reconciles statistics like `sync-stats`. It reads `mailer_dsn`, requires `bulk=auto` and handles the rows of every email sent in the same SES region, whichever access key sent them.                                                                                     |
 | `sync-stats` | Sets `is_failed` on Mautic's email statistics for recipients that are `rejected` or whose SES event is `bounced`, `rejected` or `rendering_failed`. It adds no Do Not Contact entries. A failed recipient that still has no email statistic a day later (for example, because the email was deleted) is no longer reconciled; the command reports how many. |
 | `prune`      | Deletes `accepted`, `rejected` and `unknown` rows last updated more than `--older-than` days ago (default 30), except failures not reconciled yet, and then the stored contents no row uses any more. Rows in `pending`, `sending` and `retry` are never deleted.                                                                                           |
 
 `--limit` (1 to 10000, default 1000) caps the recipients that one run resubmits and reconciles; `prune` deletes in
 batches of that many rows until nothing is left. After switching back to `bulk=off`, `retry` refuses to run and rows
 left in `retry` wait until `bulk=auto` is configured again; `sync-stats` and `prune` keep working.
+
+The outbox belongs to the SES region in `mailer_dsn`, not to the access key, so rotating the access key keeps every
+recorded recipient: `retry` still submits the waiting ones, and a replayed queue message still recognises the ones SES
+accepted. A different region starts an empty outbox. Before changing the region, wait until `status` shows no
+`pending`, `retry` or `sending` rows and no Messenger message of a bulk email can be retried any more; otherwise the
+waiting rows are only submitted once the old region is configured again, and a replayed message would send its
+recipients again.
 
 Run `retry` from cron every 5 minutes and `prune` once a day, as the same user as Mautic's other cron jobs and workers
 (the token bucket file is in Mautic's cache directory):

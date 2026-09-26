@@ -21,6 +21,7 @@ use Mautic\LeadBundle\Entity\Lead;
 use Mautic\LeadBundle\Model\DoNotContact as DncModel;
 use Mautic\LeadBundle\Model\LeadModel;
 use MauticPlugin\AmazonSesBundle\Helper\MauticEmailId;
+use MauticPlugin\AmazonSesBundle\Helper\SnsCertificateUnavailable;
 use MauticPlugin\AmazonSesBundle\Helper\SnsWebhookAuthenticator;
 use MauticPlugin\AmazonSesBundle\Mailer\Transport\AmazonSesTransport;
 use Psr\Log\LoggerInterface;
@@ -115,8 +116,17 @@ class CallbackSubscriber implements EventSubscriberInterface
         }
 
         $type = (string) $payload['Type'];
-        if (!$this->snsWebhookAuthenticator->authenticate($payload, $this->getAllowedSnsTopicArns($dsn))) {
-            $this->logger?->warning('Rejected unauthenticated Amazon SNS webhook.');
+        try {
+            $rejection = $this->snsWebhookAuthenticator->rejectionReason($payload, $this->getAllowedSnsTopicArns($dsn));
+        } catch (SnsCertificateUnavailable $e) {
+            // SNS retries a notification answered with 5xx, but drops it for good after any other error status.
+            $this->logger?->error('Amazon SNS webhook not processed yet: the signing certificate could not be downloaded, SNS will retry.', ['reason' => $e->getMessage()]);
+            $event->setResponse(new Response('SNS signing certificate unavailable', Response::HTTP_SERVICE_UNAVAILABLE));
+
+            return;
+        }
+        if (null !== $rejection) {
+            $this->logger?->warning('Rejected unauthenticated Amazon SNS webhook.', ['reason' => $rejection]);
             $event->setResponse(new Response('Invalid SNS notification', Response::HTTP_FORBIDDEN));
 
             return;

@@ -888,8 +888,12 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
 
     private function setFrom(MauticMessage $email, \Mautic\EmailBundle\Entity\Email $emailEntity): MauticMessage
     {
-        $entityEmailFrom = $this->envelope->getSender()->getAddress();
-        $entityNameFrom = $this->envelope->getSender()->getName();
+        // The envelope sender is the Return-Path whenever Mautic sets one (mailer_return_path or a bounce address), so
+        // bulk=auto keeps the From address Mautic resolved. bulk=off keeps the envelope sender of 1.0.41.
+        $default = 'auto' === ($this->settings['bulk'] ?? 'off') ? ($email->getFrom()[0] ?? null) : null;
+        $default ??= $this->envelope->getSender();
+        $entityEmailFrom = $default->getAddress();
+        $entityNameFrom = $default->getName();
         if (!empty($emailEntity->getFromAddress())) {
             $entityEmailFrom = $emailEntity->getFromAddress();
         }
