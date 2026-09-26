@@ -759,88 +759,67 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
      */
     private function acquireTokens(string $bucketFile, int $tokens, int $rate): void
     {
-        while (true) {
-            $fh = @fopen($bucketFile, 'c+');
-            if (false === $fh) {
-                $message = sprintf(
-                    'Unable to open SES rate limit token bucket file "%s". Please verify that the Mautic cache directory is writable by the web server/PHP user.',
-                    $bucketFile
-                );
-                $this->logger->error($message);
+        $fh = @fopen($bucketFile, 'c+');
+        if (false === $fh) {
+            $message = sprintf(
+                'Unable to open SES rate limit token bucket file "%s". Please verify that the Mautic cache directory is writable by the web server/PHP user.',
+                $bucketFile
+            );
+            $this->logger->error($message);
 
-                throw new TransportException($message);
-            }
+            throw new TransportException($message);
+        }
 
-            if (!flock($fh, LOCK_EX)) {
-                fclose($fh);
-                $message = sprintf('Unable to lock SES rate limit token bucket file "%s".', $bucketFile);
-                $this->logger->error($message);
+        if (!flock($fh, LOCK_EX)) {
+            fclose($fh);
+            $message = sprintf('Unable to lock SES rate limit token bucket file "%s".', $bucketFile);
+            $this->logger->error($message);
 
-                throw new TransportException($message);
-            }
+            throw new TransportException($message);
+        }
 
-            $data = fread($fh, 256);
-            $bucket = $data ? json_decode($data, true) : null;
-            $now = microtime(true);
+        $data = fread($fh, 256);
+        $bucket = $data ? json_decode($data, true) : null;
+        $now = microtime(true);
 
-            if (!$bucket || !isset($bucket['tokens'], $bucket['last_time'])) {
-                $bucket = ['tokens' => 0.0, 'last_time' => $now];
-            }
+        if (!$bucket || !isset($bucket['tokens'], $bucket['last_time'])) {
+            $bucket = ['tokens' => 0.0, 'last_time' => $now];
+        }
 
-            // Refill tokens based on elapsed time, cap at rate
-            $elapsed = $now - $bucket['last_time'];
-            $bucket['tokens'] = min((float) $rate, $bucket['tokens'] + $elapsed * $rate);
-            $bucket['last_time'] = $now;
+        // Refill by elapsed time, but never above zero: the bucket stores no burst allowance. An idle bucket used to
+        // fill up to one second of the rate, so the first second of a send could submit twice the rate (SES measures
+        // utilization per second and reported it). Now the balance only records debt.
+        $elapsed = $now - $bucket['last_time'];
+        $bucket['tokens'] = min(0.0, (float) $bucket['tokens'] + $elapsed * $rate);
+        $bucket['last_time'] = $now;
 
-            if ($bucket['tokens'] >= $tokens) {
-                $bucket['tokens'] -= $tokens;
-                if (!ftruncate($fh, 0)) {
-                    flock($fh, LOCK_UN);
-                    fclose($fh);
-                    $message = sprintf('Unable to truncate SES rate limit token bucket file "%s".', $bucketFile);
-                    $this->logger->error($message);
+        // Take the tokens right away, so concurrent workers queue up behind this debt, then wait outside the lock
+        // until the debt is repaid at the configured rate. Submissions are thereby paced at exactly the rate from the
+        // first one on, across all workers sharing the file.
+        $bucket['tokens'] -= $tokens;
+        $waitUs = (int) ceil((-$bucket['tokens'] / $rate) * 1_000_000);
 
-                    throw new TransportException($message);
-                }
-                rewind($fh);
-                if (false === fwrite($fh, json_encode($bucket))) {
-                    flock($fh, LOCK_UN);
-                    fclose($fh);
-                    $message = sprintf('Unable to write SES rate limit token bucket file "%s".', $bucketFile);
-                    $this->logger->error($message);
-
-                    throw new TransportException($message);
-                }
-                flock($fh, LOCK_UN);
-                fclose($fh);
-                return;
-            }
-
-            // Not enough tokens — save current state so next iteration sees elapsed time,
-            // then release lock and sleep outside
-            $deficit = $tokens - $bucket['tokens'];
-            $waitUs = (int) ceil(($deficit / $rate) * 1_000_000);
-
-            if (!ftruncate($fh, 0)) {
-                flock($fh, LOCK_UN);
-                fclose($fh);
-                $message = sprintf('Unable to truncate SES rate limit token bucket file "%s".', $bucketFile);
-                $this->logger->error($message);
-
-                throw new TransportException($message);
-            }
-            rewind($fh);
-            if (false === fwrite($fh, json_encode($bucket))) {
-                flock($fh, LOCK_UN);
-                fclose($fh);
-                $message = sprintf('Unable to write SES rate limit token bucket file "%s".', $bucketFile);
-                $this->logger->error($message);
-
-                throw new TransportException($message);
-            }
+        if (!ftruncate($fh, 0)) {
             flock($fh, LOCK_UN);
             fclose($fh);
+            $message = sprintf('Unable to truncate SES rate limit token bucket file "%s".', $bucketFile);
+            $this->logger->error($message);
 
+            throw new TransportException($message);
+        }
+        rewind($fh);
+        if (false === fwrite($fh, json_encode($bucket))) {
+            flock($fh, LOCK_UN);
+            fclose($fh);
+            $message = sprintf('Unable to write SES rate limit token bucket file "%s".', $bucketFile);
+            $this->logger->error($message);
+
+            throw new TransportException($message);
+        }
+        flock($fh, LOCK_UN);
+        fclose($fh);
+
+        if ($waitUs > 0) {
             usleep($waitUs);
         }
     }

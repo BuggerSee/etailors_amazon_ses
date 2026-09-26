@@ -14,6 +14,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Changed
 - Inline retries on the raw path now charge the shared token bucket, like first attempts.
+- The shared token bucket no longer stores a burst allowance. Its balance only records debt, and a submission takes its tokens first and then waits until the debt is repaid. Before, an idle bucket held one second of the rate, so the first second of a send could submit up to twice `ratelimit`, which the SES console reported as sending rate utilization above 100 %. Sending is now paced at `ratelimit` from the first request on, across all workers.
 - Errors from a nested SNS `Notification` message now propagate to the callback's HTTP response instead of being answered with success.
 - SES event types `Send`, `Reject` and `Rendering Failure` are accepted by the callback and no longer logged as unknown.
 - The SNS callback downloads the signing certificate through Symfony HttpClient with a 5-second timeout and caches it for an hour. When the certificate cannot be downloaded, the callback is now answered `503`, which SNS retries, instead of `403`, which made SNS drop the bounce or complaint for good; rejected callbacks are logged with the reason.
