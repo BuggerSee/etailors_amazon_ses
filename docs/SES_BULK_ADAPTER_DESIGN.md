@@ -1,6 +1,19 @@
 # SES bulk adapter: implementation and contribution boundaries
 
-Status: implementation design, not a working adapter. Based on upstream plugin 1.0.41 (`46b8ddb`) and the Mautic 6/7 snapshots in [the research](SES_BULK_TEMPLATE_RESEARCH.md).
+Status (2026-09-26): implemented on this branch as an opt-in adapter (`bulk=auto`; `bulk=off` stays the default), on top of upstream plugin 1.0.41 (`46b8ddb`) and the Mautic 6/7 snapshots in [the research](SES_BULK_TEMPLATE_RESEARCH.md). Implemented, by file:
+
+- `Mailer/Bulk/SharedTemplateCompiler.php`: one inline template and per-recipient replacement data from Mautic's resolved tokens, with the reason when a message or recipient is not eligible.
+- `Mailer/Bulk/BulkBatcher.php`: batches of identical request fields, at most 50 entries and 1,000,000 bytes.
+- `Mailer/Bulk/BulkSender.php`: atomic claims, a bounded window of in-flight requests without SDK retries, and per-recipient result classification.
+- `Mailer/Bulk/DeliveryStore.php`, `Entity/BulkDelivery.php`, `Entity/BulkContent.php`: the outbox, retry backoff, claim expiry, SES event recording and reconciliation into `email_stats.is_failed`.
+- `Mailer/Transport/AmazonSesTransport.php`: the message-level eligibility gate, per-recipient raw fallback and the shared token bucket for every submission, retries included.
+- `Mailer/Factory/AmazonSesTransportFactory.php`: the `bulk`, `bulk_batch_size`, `bulk_concurrency` and `endpoint` DSN options.
+- `Command/BulkCommand.php`: `mautic:ses:bulk install|status|retry|sync-stats`.
+- `Migrations/Version_1_0_42.php`: the outbox tables for existing installations.
+- `EventSubscriber/CallbackSubscriber.php`: SES events passed to the outbox.
+- `Tests/E2E/`: a fake SES server and an offline harness, run against local Mautic 6.0.9 and 7.2.1 with synchronous sending and with Messenger workers.
+
+Remaining: validation against SES itself on Mautic 6/7 with Messenger (the sandbox and canary tiers in [SES_E2E_TESTING.md](SES_E2E_TESTING.md)), benchmarks at 80 recipients/s against SES, and broader eligibility (section 4 below). The rest of this document is the design as written before the implementation; the [README](../README.MD#bulk-sending-with-shared-ses-templates-experimental) describes the adapter as built.
 
 ## Decision
 

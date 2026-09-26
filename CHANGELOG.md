@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+### Added
+- Experimental bulk sending with shared SES templates, off by default. With the DSN option `bulk=auto`, eligible emails are sent with `SendBulkEmail`: one inline template per request, each recipient's resolved Mautic tokens as replacement data and up to 50 recipients per request (`bulk_batch_size`, 1 to 50, default 50; `bulk_concurrency`, 1 to 10, default 2). Every recipient is recorded in a delivery outbox before submission, charged against the shared token bucket and classified from its own SES result. Emails and recipients that cannot use a shared template fall back to raw sending before anything is submitted. SES events tagged with `mautic_delivery_id` update the outbox. See the README section "Bulk sending with shared SES templates (experimental)".
+- `mautic:ses:bulk` console command with the actions `install`, `status`, `retry` and `sync-stats`.
+- Plugin migration `Version_1_0_42`, which creates the outbox tables `ses_bulk_contents` and `ses_bulk_deliveries` on `mautic:plugins:reload` once the plugin version is raised.
+- `endpoint` DSN option to replace the regional SES API endpoint with an absolute http(s) URL (URL-encoded in a DSN string).
+- Fake SES server (`Tests/E2E/fake-ses-server.php`) and an offline end-to-end harness (`Tests/E2E/offline/`) for local runs without AWS; see `docs/SES_E2E_TESTING.md`.
+
+### Changed
+- Inline retries on the raw path now charge the shared token bucket, like first attempts.
+- Errors from a nested SNS `Notification` message now propagate to the callback's HTTP response instead of being answered with success.
+- SES event types `Send`, `Reject` and `Rendering Failure` are accepted by the callback and no longer logged as unknown.
+- `aws/aws-sdk-php` requirement raised to `^3.325.1`, the first version whose SES v2 model supports inline template content.
+
 ## [1.0.41] - 2026-09-25
 - `CallbackSubscriber` now unescapes Mautic's `%%` in `mailer_dsn` before parsing it, so an `sns_topic_arn` DSN option saved through the Email settings UI (stored as `arn%%3Aaws%%3A...`) matches the SNS `TopicArn` instead of decoding to `arn%:aws%:...` and rejecting every callback with 403.
 

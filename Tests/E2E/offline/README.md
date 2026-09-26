@@ -271,18 +271,20 @@ sending process's maximum RSS. The DSN stays in place and the fake server keeps 
 The newsletter used for the numbers below (a compiled 164 KB MJML newsletter) is not committed; pass your own HTML as
 `html-file` (it becomes `SEED_HTML_FILE`). Without it the small built-in fixture is sent.
 
-Example, measured on 2026-09-26 against Mautic 6.0.9 on an Apple Silicon Mac, one sending process, with the
-164 KB newsletter. The first pair ran with the defaults (`RATELIMIT=100000`, no latency), the second with
-`RATELIMIT=80 FAKE_SES_DELAY_MS=100`:
+Example, measured on 2026-09-26 against Mautic 7.2.1 on an Apple Silicon Mac, one sending process, with the
+164 KB newsletter, after the plain-text part became shared between recipients. The first pair ran with the defaults
+(`RATELIMIT=100000`, no latency), the second with `RATELIMIT=80 FAKE_SES_DELAY_MS=100`:
 
 ```
 mode  contacts  ratelimit  delay_ms  batch  requests  recipients_submitted  bytes      bytes_per_recipient  real_s  user_s  sys_s  max_rss_mb
-auto  1000      100000     0         500    69        1004                  66323153   66059                8.45    5.59    0.29   141
-off   1000      100000     0         500    1004      1004                  318483620  317215               10.68   8.33    0.45   629
-auto  400       80         100       500    27        404                   26539637   65692                6.78    2.60    0.17   126
-off   400       80         100       500    404       404                   128154610  317214               12.69   3.77    0.23   214
+auto  1000      100000     0         500    21        1004                  15095024   15035                7.78    5.38    0.26   136
+off   1000      100000     0         500    1004      1004                  320853092  319575               10.76   8.46    0.40   631
+auto  400       80         100       500    9         404                   6239442    15444                7.07    2.54    0.15   122
+off   400       80         100       500    404       404                   129108076  319574               14.95   4.36    0.23   216
 ```
 
-With throttling and latency one sender reached about 60 recipients/s with `bulk=auto` and about 32 recipients/s with
-`bulk=off`. In these runs 51.5 KB of the 66 KB per bulk recipient was the recipient's own copy of the plain-text part,
-which also kept the batches at about 16 entries because of the 1 MB request limit.
+With throttling and latency one sender reached about 57 recipients/s with `bulk=auto` and about 27 recipients/s with
+`bulk=off`. A bulk recipient cost about 15 KB of request body, and the request counts equal ceil(recipients / 50), so
+every batch but the remainder carried 50 entries. Before the plain-text part was shared, each bulk recipient carried
+its own copy of it (66 KB per recipient in total for this newsletter), and the 1 MB request limit kept the batches at
+about 16 entries.
