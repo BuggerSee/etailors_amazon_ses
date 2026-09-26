@@ -16,7 +16,7 @@ final class DeliveryStore
     private string $deliveries;
     private string $contents;
     private bool $ready = false;
-    /** @var array<string, true> content ids this instance inserted or found present */
+    /** @var array<string, true> content ids this instance inserted or found present, reset for every message */
     private array $contentIds = [];
 
     public function __construct(private EntityManagerInterface $entityManager)
@@ -61,6 +61,29 @@ final class DeliveryStore
         $this->ready = true;
     }
 
+    /**
+     * Saves every delivery of one message in a single transaction before anything is submitted. A failure rolls all of
+     * them back, so nothing is left for the retry command while Mautic handles the failed message itself.
+     *
+     * @param iterable<list<array<string, mixed>>> $batches
+     *
+     * @return list<list<string>> the delivery ids of each batch
+     */
+    public function enqueueBatches(iterable $batches, string $scope): array
+    {
+        $this->assertInstalled();
+        $this->contentIds = [];
+
+        return $this->entityManager->getConnection()->transactional(function () use ($batches, $scope): array {
+            $ids = [];
+            foreach ($batches as $batch) {
+                $ids[] = array_map(fn (array $delivery): string => $this->enqueue($delivery, $scope), $batch);
+            }
+
+            return $ids;
+        });
+    }
+
     /** Save before submission. Existing deliveries are deliberately immutable on queue replay. */
     public function enqueue(array $delivery, string $scope): string
     {
@@ -68,7 +91,7 @@ final class DeliveryStore
         $db = $this->entityManager->getConnection();
         $now = time();
         $contentId = hash('sha256', serialize([$scope, $delivery['operation'], $delivery['email_id'], $delivery['common']]));
-        // Recipients of one message share content: insert it once per instance instead of failing once per recipient.
+        // Recipients of one message share content: insert it once per message instead of failing once per recipient.
         if (!isset($this->contentIds[$contentId])) {
             try {
                 $db->insert($this->contents, [
@@ -77,7 +100,8 @@ final class DeliveryStore
                     'requests' => 0, 'request_bytes' => 0, 'created_at' => $now,
                 ]);
             } catch (UniqueConstraintViolationException) {
-                // Common content is shared across recipients and workers.
+                // Common content is shared across recipients and workers. created_at is the last use, so prune keeps it.
+                $db->update($this->contents, ['created_at' => $now], ['id' => $contentId]);
             }
             $this->contentIds[$contentId] = true;
         }
@@ -111,18 +135,34 @@ final class DeliveryStore
         return $db->fetchAssociative("SELECT * FROM {$this->deliveries} WHERE id = ?", [$id]) ?: null;
     }
 
-    public function complete(array $row, string $state, string $reason = '', string $messageId = ''): void
+    /** @return string the state written, rejected when the last retry was used up */
+    public function complete(array $row, string $state, string $reason = '', string $messageId = ''): string
     {
         if ('retry' === $state && (int) $row['attempts'] >= 4) {
             $state = 'rejected';
             $reason = 'retry_exhausted:'.$reason;
         }
         // Accepted on a retry drops the earlier attempt's failure reason. Before the first attempt the reason can only be
-        // the raw-fallback reason from enqueue(), which stays. A failed attempt already replaced that reason with its own,
-        // so a raw-fallback row accepted on a retry ends up with an empty reason.
+        // the raw-fallback reason from enqueue() or a reason from release(), and only the raw-fallback reason stays. A
+        // failed attempt already replaced that reason with its own, so a raw-fallback row accepted on a retry ends up with
+        // an empty reason.
         $this->entityManager->getConnection()->executeStatement(
-            "UPDATE {$this->deliveries} SET state = ?, reason = CASE WHEN ? = 'accepted' AND attempts > 1 THEN '' WHEN ? = '' THEN reason ELSE ? END, message_id = CASE WHEN ? = '' THEN message_id ELSE ? END, next_attempt = ?, updated_at = ?, synced = 0 WHERE id = ? AND claim = ? AND state = 'sending'",
+            "UPDATE {$this->deliveries} SET state = ?, reason = CASE WHEN ? = 'accepted' AND (attempts > 1 OR reason IN ('local_preflight_failure', 'ACCOUNT_DAILY_QUOTA_EXCEEDED')) THEN '' WHEN ? = '' THEN reason ELSE ? END, message_id = CASE WHEN ? = '' THEN message_id ELSE ? END, next_attempt = ?, updated_at = ?, synced = 0 WHERE id = ? AND claim = ? AND state = 'sending'",
             [$state, $state, $reason, substr($reason, 0, 128), $messageId, $messageId, time() + min(3600, 30 * (2 ** (int) $row['attempts'])), time(), $row['id'], $row['claim']]
+        );
+
+        return $state;
+    }
+
+    /**
+     * Hands a claimed row back as retry without spending the attempt its claim counted: for rows never submitted
+     * because a local step failed, and for recipients SES deferred because the 24-hour quota was used up.
+     */
+    public function release(array $row, string $reason, int $delay): void
+    {
+        $this->entityManager->getConnection()->executeStatement(
+            "UPDATE {$this->deliveries} SET state = 'retry', attempts = attempts - 1, reason = ?, next_attempt = ?, updated_at = ?, synced = 0 WHERE id = ? AND claim = ? AND state = 'sending'",
+            [$reason, time() + $delay, time(), $row['id'], $row['claim']]
         );
     }
 
@@ -202,24 +242,68 @@ final class DeliveryStore
         return ['email_id' => $emailId, 'recipients' => $recipients, 'requests' => $requests];
     }
 
-    /** Reconcile after Mautic inserts its statistics, without adding a DNC/bounce for transport errors. */
-    public function syncFailures(int $limit = 1000): int
+    /**
+     * Reconcile after Mautic inserts its statistics, without adding a DNC/bounce for transport errors.
+     *
+     * @return array{reconciled: int, without_statistic: int}
+     */
+    public function syncFailures(int $limit = 1000): array
     {
         $limit = max(1, min(10000, $limit));
         $db = $this->entityManager->getConnection();
         $table = $this->entityManager->getClassMetadata(Stat::class)->getTableName();
-        $rows = $db->fetchAllAssociative("SELECT id, tracking_hash, email_id FROM {$this->deliveries} WHERE synced = 0 AND (state = 'rejected' OR event IN ('rendering_failed', 'rejected', 'bounced')) ORDER BY updated_at LIMIT {$limit}");
+        $failed = "{$this->deliveries}.synced = 0 AND ({$this->deliveries}.state = 'rejected' OR {$this->deliveries}.event IN ('rendering_failed', 'rejected', 'bounced'))";
+        // Stats may not exist yet (synchronous sending). A day later they never will (for example, the email was deleted):
+        // such rows count as reconciled, so they neither wait forever nor block prune.
+        $withoutStatistic = $db->executeStatement(
+            "UPDATE {$this->deliveries} SET synced = 1 WHERE {$failed} AND {$this->deliveries}.updated_at < ? AND NOT EXISTS (SELECT 1 FROM {$table} s WHERE s.tracking_hash = {$this->deliveries}.tracking_hash AND s.email_id = {$this->deliveries}.email_id)",
+            [time() - 86400]
+        );
+        // Only rows with a statistic are read, so rows still waiting for theirs never hold up the others.
+        $rows = $db->fetchAllAssociative("SELECT {$this->deliveries}.id, {$this->deliveries}.tracking_hash, {$this->deliveries}.email_id FROM {$this->deliveries} INNER JOIN {$table} s ON s.tracking_hash = {$this->deliveries}.tracking_hash AND s.email_id = {$this->deliveries}.email_id WHERE {$failed} ORDER BY {$this->deliveries}.updated_at LIMIT {$limit}");
         $count = 0;
         foreach ($rows as $row) {
-            // Stats may not exist yet (synchronous sending); leave the row pending reconciliation.
-            if (!$db->fetchOne("SELECT id FROM {$table} WHERE tracking_hash = ? AND email_id = ?", [$row['tracking_hash'], $row['email_id']])) {
-                continue;
-            }
             $db->executeStatement("UPDATE {$table} SET is_failed = 1 WHERE tracking_hash = ? AND email_id = ?", [$row['tracking_hash'], $row['email_id']]);
             $db->update($this->deliveries, ['synced' => 1], ['id' => $row['id']]);
             ++$count;
         }
 
-        return $count;
+        return ['reconciled' => $count, 'without_statistic' => $withoutStatistic];
+    }
+
+    /**
+     * Deletes finished deliveries last updated before the cutoff, except failures still waiting for reconciliation, and
+     * then the contents no delivery uses any more. Works in batches of $batchSize rows until nothing is left.
+     *
+     * @return array{deliveries: int, contents: int}
+     */
+    public function prune(int $olderThanDays, int $batchSize = 1000): array
+    {
+        $this->assertInstalled();
+        $db = $this->entityManager->getConnection();
+        $batchSize = max(1, min(10000, $batchSize));
+        $cutoff = time() - max(1, $olderThanDays) * 86400;
+        $deleted = ['deliveries' => 0, 'contents' => 0];
+        // Both loops walk the primary key, so every row is read once per run however many batches it takes.
+        $last = '';
+        do {
+            $ids = $db->fetchFirstColumn("SELECT id FROM {$this->deliveries} WHERE id > ? AND state IN ('accepted', 'rejected', 'unknown') AND updated_at < ? AND NOT (synced = 0 AND (state = 'rejected' OR event IN ('rendering_failed', 'rejected', 'bounced'))) ORDER BY id LIMIT {$batchSize}", [$last, $cutoff]);
+            if ($ids) {
+                // updated_at is checked again: a row an SNS event changed since the SELECT stays.
+                $deleted['deliveries'] += $db->executeStatement("DELETE FROM {$this->deliveries} WHERE id IN (".implode(', ', array_fill(0, count($ids), '?')).') AND updated_at < ?', [...$ids, $cutoff]);
+                $last = end($ids);
+            }
+        } while (count($ids) === $batchSize);
+        $last = '';
+        do {
+            $ids = $db->fetchFirstColumn("SELECT c.id FROM {$this->contents} c LEFT JOIN {$this->deliveries} d ON d.content_id = c.id WHERE c.id > ? AND d.id IS NULL AND c.created_at < ? ORDER BY c.id LIMIT {$batchSize}", [$last, $cutoff]);
+            if ($ids) {
+                // Checked again: a message saved since the SELECT may use the content again, and enqueue() refreshed created_at.
+                $deleted['contents'] += $db->executeStatement("DELETE FROM {$this->contents} WHERE id IN (".implode(', ', array_fill(0, count($ids), '?')).") AND created_at < ? AND NOT EXISTS (SELECT 1 FROM {$this->deliveries} d WHERE d.content_id = {$this->contents}.id)", [...$ids, $cutoff]);
+                $last = end($ids);
+            }
+        } while (count($ids) === $batchSize);
+
+        return $deleted;
     }
 }

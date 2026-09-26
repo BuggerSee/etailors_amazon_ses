@@ -33,6 +33,13 @@ $contactIds = array_map('intval', $state['contact_ids']);
 require $root.'/config/local.php';
 $pdo = new PDO(sprintf('mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4', $parameters['db_host'], ($parameters['db_port'] ?? null) ?: 3306, $parameters['db_name']), $parameters['db_user'], $parameters['db_password'], [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
 $prefix = $parameters['db_table_prefix'] ?? '';
+// A request carries at most min(50, bulk_batch_size, ratelimit / bulk_concurrency) recipients (see
+// AmazonSesTransport::bulkWindow()), and each mautic:broadcasts:send batch of BATCH contacts is one message whose
+// recipients are split into requests on their own.
+parse_str((string) parse_url(str_replace('%%', '%', (string) ($parameters['mailer_dsn'] ?? '')), PHP_URL_QUERY), $dsnOptions);
+$sendRate = (int) ($dsnOptions['ratelimit'] ?? (getenv('FAKE_SES_RATE') ?: 80));
+$perRequest = min(50, (int) ($dsnOptions['bulk_batch_size'] ?? 50), max(1, intdiv($sendRate, (int) ($dsnOptions['bulk_concurrency'] ?? 2))));
+$broadcastBatch = max(1, (int) (getenv('BATCH') ?: 100));
 
 $failures = 0;
 $check = static function (bool $ok, string $label, string $detail = '') use (&$failures): void {
@@ -144,7 +151,7 @@ foreach ($bulkRequests as $i => $req) {
     $templates[hash('sha256', json_encode($template))] = true;
     $entries = $body['BulkEmailEntries'] ?? [];
     $results = $resp['BulkEmailEntryResults'] ?? [];
-    $check(count($entries) <= 50 && count($entries) === count($results), "bulk request $i has <=50 entries and one result per entry", count($entries).' entries');
+    $check(count($entries) <= $perRequest && count($entries) === count($results), "bulk request $i has <=$perRequest entries and one result per entry", count($entries).' entries');
     $firstSubmissions = 0;
     foreach ($entries as $n => $entry) {
         ++$entriesSeen;
@@ -219,7 +226,11 @@ foreach ($bulkRequests as $i => $req) {
 }
 $check([] === array_diff_key($seeded, $submitted) && [] === array_diff_key($submitted, $seeded), 'every seeded recipient appears exactly once across the initial bulk entries', sprintf('%d distinct addresses in %d entries (%d resubmissions)', count($submitted), $entriesSeen, $entriesSeen - count($submitted)));
 $check(1 === count($templates), 'all bulk requests share one identical inline template', count($templates).' distinct templates');
-$check(count($initialSizes) === (int) ceil(count($seeded) / 50), 'initial request count equals ceil(recipients / 50)', count($initialSizes).' requests for '.count($seeded).' recipients; batch sizes '.implode(',', $initialSizes).'; '.count($retrySizes).' retry requests'.([] === $retrySizes ? '' : ' of '.implode(',', $retrySizes)));
+$expectedRequests = 0;
+for ($left = count($seeded); $left > 0; $left -= $broadcastBatch) {
+    $expectedRequests += (int) ceil(min($left, $broadcastBatch) / $perRequest);
+}
+$check(count($initialSizes) === $expectedRequests, "initial request count equals ceil(recipients / $perRequest) per batch of $broadcastBatch", count($initialSizes).' requests for '.count($seeded).' recipients, expected '.$expectedRequests.'; batch sizes '.implode(',', $initialSizes).'; '.count($retrySizes).' retry requests'.([] === $retrySizes ? '' : ' of '.implode(',', $retrySizes)));
 printf("bytes: %d bytes of bulk request JSON for %d entries (%.1f KB per entry)\n", $bulkBytes, max(1, $entriesSeen), $bulkBytes / 1024 / max(1, $entriesSeen));
 
 // ---- Mautic statistics -----------------------------------------------------------------------

@@ -12,6 +12,9 @@ use Psr\Log\LoggerInterface;
 
 final class BulkSender
 {
+    /** A recipient over the 24-hour quota is retried hourly, without spending attempts, for this long after it was saved. */
+    public const QUOTA_DEFERRAL = 30 * 3600;
+
     public function __construct(private DeliveryStore $store, private LoggerInterface $logger)
     {
     }
@@ -83,10 +86,11 @@ final class BulkSender
                 }
             }
         } finally {
-            // A local step failed before these claims were submitted; releasing them for a later retry is safe.
+            // A local step failed before these claims were submitted. Releasing them for a later retry is safe, and it does
+            // not spend one of their attempts, because nothing reached SES.
             foreach ($pending as $rows) {
                 foreach ($rows as $row) {
-                    $this->store->complete($row, 'retry', 'local_preflight_failure');
+                    $this->store->release($row, 'local_preflight_failure', 60);
                 }
             }
             // Submitted requests are recorded even when a later request fails its preflight.
@@ -108,9 +112,12 @@ final class BulkSender
 
     private function recordResult(array $rows, array $content, string $contentId, Result $result): void
     {
+        $outcomes = [];
         if ('raw' === $content['operation']) {
             $messageId = (string) ($result['MessageId'] ?? '');
-            $this->store->complete($rows[0], $messageId ? 'accepted' : 'unknown', $messageId ? '' : 'missing_result', $messageId);
+            $reason = $messageId ? '' : 'missing_result';
+            self::tally($outcomes, $this->store->complete($rows[0], $messageId ? 'accepted' : 'unknown', $reason, $messageId), $reason);
+            $this->logOutcomes($outcomes, $content['email_id'], $contentId);
 
             return;
         }
@@ -118,8 +125,9 @@ final class BulkSender
         // Positional results cannot safely be mapped if the count differs.
         if (!is_array($results) || count($results) !== count($rows)) {
             foreach ($rows as $row) {
-                $this->store->complete($row, 'unknown', 'invalid_result_count');
+                self::tally($outcomes, $this->store->complete($row, 'unknown', 'invalid_result_count'), 'invalid_result_count');
             }
+            $this->logOutcomes($outcomes, $content['email_id'], $contentId);
 
             return;
         }
@@ -128,34 +136,56 @@ final class BulkSender
             $status = $entry['Status'] ?? '';
             $messageId = (string) ($entry['MessageId'] ?? '');
             if ('SUCCESS' === $status && '' !== $messageId) {
-                $this->store->complete($row, 'accepted', '', $messageId);
+                self::tally($outcomes, $this->store->complete($row, 'accepted', '', $messageId), '');
+            } elseif ('ACCOUNT_DAILY_QUOTA_EXCEEDED' === $status && time() - (int) $row['created_at'] < self::QUOTA_DEFERRAL) {
+                // The 24-hour quota frees up gradually. Waiting an hour between attempts, without spending one of the
+                // four attempts, lets the retry command drain these recipients as the quota returns.
+                $this->store->release($row, $status, 3600);
+                self::tally($outcomes, 'retry', $status);
             } elseif (in_array($status, ['ACCOUNT_THROTTLED', 'ACCOUNT_DAILY_QUOTA_EXCEEDED', 'TRANSIENT_FAILURE', 'FAILED'], true)) {
-                $this->store->complete($row, 'retry', $status);
+                self::tally($outcomes, $this->store->complete($row, 'retry', $status), $status);
             } elseif (in_array($status, ['MESSAGE_REJECTED', 'MAIL_FROM_DOMAIN_NOT_VERIFIED', 'CONFIGURATION_SET_NOT_FOUND', 'CONFIGURATION_SET_DOES_NOT_EXIST', 'TEMPLATE_NOT_FOUND', 'TEMPLATE_DOES_NOT_EXIST', 'ACCOUNT_SUSPENDED', 'INVALID_SENDING_POOL_NAME', 'ACCOUNT_SENDING_PAUSED', 'CONFIGURATION_SET_SENDING_PAUSED', 'INVALID_PARAMETER', 'INVALID_PARAMETER_VALUE'], true)) {
-                $this->store->complete($row, 'rejected', $status);
+                self::tally($outcomes, $this->store->complete($row, 'rejected', $status), $status);
             } else {
-                $this->store->complete($row, 'unknown', 'unrecognized_result');
+                self::tally($outcomes, $this->store->complete($row, 'unknown', 'unrecognized_result'), 'unrecognized_result');
             }
         }
-        $this->logger->info('SES shared-template request processed.', ['email_id' => $content['email_id'], 'recipients' => count($rows), 'content_id' => $contentId]);
+        $this->logOutcomes($outcomes, $content['email_id'], $contentId);
     }
 
     private function recordFailure(array $rows, \Throwable $e): void
     {
-        if ($e instanceof \InvalidArgumentException) {
-            // SDK input validation failed before dispatch.
-            foreach ($rows as $row) {
-                $this->store->complete($row, 'rejected', 'sdk_validation');
-            }
-            $this->logger->error('SES bulk SDK validation failed.', ['exception' => $e]);
-
-            return;
-        }
-        [$state, $reason] = $this->exceptionOutcome($e);
+        // SDK input validation failed before dispatch; otherwise the request itself failed.
+        [$state, $reason] = $e instanceof \InvalidArgumentException ? ['rejected', 'sdk_validation'] : $this->exceptionOutcome($e);
+        $outcomes = [];
         foreach ($rows as $row) {
-            $this->store->complete($row, $state, $reason);
+            self::tally($outcomes, $this->store->complete($row, $state, $reason), $reason);
         }
-        $this->logger->warning('SES request did not return recipient results.', ['state' => $state, 'reason' => $reason, 'recipients' => count($rows)]);
+        $this->logOutcomes($outcomes, $rows[0]['email_id'] ?? null, $rows[0]['content_id'] ?? null, $e);
+    }
+
+    /** @param array<string, array<string, int>> $outcomes recipients by state and reason */
+    private static function tally(array &$outcomes, string $state, string $reason): void
+    {
+        $outcomes[$state][$reason] = ($outcomes[$state][$reason] ?? 0) + 1;
+    }
+
+    /**
+     * Mautic's production log keeps only errors, and Mautic already counts these recipients as sent, so a request that
+     * leaves any recipient rejected or unknown is logged as an error.
+     *
+     * @param array<string, array<string, int>> $outcomes recipients by state and reason
+     */
+    private function logOutcomes(array $outcomes, mixed $emailId, ?string $contentId, ?\Throwable $e = null): void
+    {
+        $context = ['email_id' => $emailId, 'content_id' => $contentId, 'recipients' => array_sum(array_map('array_sum', $outcomes)), 'outcomes' => $outcomes] + ($e ? ['exception' => $e] : []);
+        if (isset($outcomes['rejected']) || isset($outcomes['unknown'])) {
+            $this->logger->error('SES request left recipients rejected or unknown; see mautic:ses:bulk status.', $context);
+        } elseif (isset($outcomes['retry'])) {
+            $this->logger->warning('SES request left recipients for mautic:ses:bulk retry.', $context);
+        } else {
+            $this->logger->info('SES shared-template request processed.', $context);
+        }
     }
 
     private function exceptionOutcome(\Throwable $e): array

@@ -27,9 +27,10 @@ final class BulkCommand extends Command
 
     protected function configure(): void
     {
-        $this->addArgument('action', InputArgument::REQUIRED, 'install, status, retry or sync-stats')
+        $this->addArgument('action', InputArgument::REQUIRED, 'install, status, retry, sync-stats or prune')
             ->addOption('email-id', null, InputOption::VALUE_REQUIRED, 'Filter status by Mautic email ID')
-            ->addOption('limit', null, InputOption::VALUE_REQUIRED, 'Maximum recipients per recovery/reconciliation run', '1000')
+            ->addOption('limit', null, InputOption::VALUE_REQUIRED, 'Maximum recipients per recovery/reconciliation run, rows per prune batch', '1000')
+            ->addOption('older-than', null, InputOption::VALUE_REQUIRED, 'Prune rows finished more than this many days ago', '30')
             ->addOption('json', null, InputOption::VALUE_NONE, 'Machine-readable status');
     }
 
@@ -37,15 +38,16 @@ final class BulkCommand extends Command
     {
         $io = new SymfonyStyle($input, $output);
         $action = $input->getArgument('action');
-        if (!in_array($action, ['install', 'status', 'retry', 'sync-stats'], true)) {
-            $io->error('Action must be install, status, retry or sync-stats.');
+        if (!in_array($action, ['install', 'status', 'retry', 'sync-stats', 'prune'], true)) {
+            $io->error('Action must be install, status, retry, sync-stats or prune.');
 
             return Command::INVALID;
         }
         $limit = filter_var($input->getOption('limit'), FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 10000]]);
         $emailId = $input->getOption('email-id');
-        if (false === $limit || (null !== $emailId && false === filter_var($emailId, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]))) {
-            $io->error('Use a positive email ID and a limit between 1 and 10000.');
+        $olderThan = filter_var($input->getOption('older-than'), FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        if (false === $limit || false === $olderThan || (null !== $emailId && false === filter_var($emailId, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]))) {
+            $io->error('Use a positive email ID, a limit between 1 and 10000 and a positive number of days.');
 
             return Command::INVALID;
         }
@@ -68,6 +70,12 @@ final class BulkCommand extends Command
 
             return Command::SUCCESS;
         }
+        if ('prune' === $action) {
+            $deleted = $this->store->prune($olderThan, $limit);
+            $io->success(sprintf('Deleted %d deliveries and %d contents finished more than %d days ago.', $deleted['deliveries'], $deleted['contents'], $olderThan));
+
+            return Command::SUCCESS;
+        }
         if ('retry' === $action) {
             $dsn = Dsn::fromString(str_replace('%%', '%', (string) $this->parameters->get('mailer_dsn')));
             $transport = $this->factory->create($dsn);
@@ -77,8 +85,11 @@ final class BulkCommand extends Command
             $count = $transport->retryBulk($limit);
             $io->writeln(sprintf('Processed up to %d due recipients. Inspect status for their outcomes.', $count));
         }
-        $count = $this->store->syncFailures($limit);
-        $io->success(sprintf('Reconciled %d failed recipient statistics. No contacts were added to DNC.', $count));
+        $sync = $this->store->syncFailures($limit);
+        $io->success(sprintf('Reconciled %d failed recipient statistics. No contacts were added to DNC.', $sync['reconciled']));
+        if ($sync['without_statistic']) {
+            $io->note(sprintf('%d failed recipients have had no Mautic email statistic for a day (for example, the email was deleted) and are no longer reconciled.', $sync['without_statistic']));
+        }
 
         return Command::SUCCESS;
     }

@@ -309,21 +309,38 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
         BulkSender::assertSupported($this->client);
         $scope = BulkSender::scope($this->client);
         $this->deliveryStore->expireClaims($scope);
+        [$limit, $concurrency] = $this->bulkWindow();
+        // Every recipient is saved in one transaction before the first request. Up to the commit a failure leaves nothing
+        // behind, so the exception can go to Mautic, which counts the message as failed and sends it again later.
+        $batches = $this->deliveryStore->enqueueBatches((new BulkBatcher())->batches($this->bulkDeliveries($scope), $limit), $scope);
+        $emailId = $this->getEmailIdFromMetadata($this->message->getMetadata());
+        try {
+            // One send() call for all batches keeps up to $concurrency requests in flight.
+            $this->bulkSender->send($this->client, $batches, fn (int $recipients) => $this->acquireRecipientQuota($recipients), $concurrency);
+        } catch (\Throwable $e) {
+            // From here on the outbox owns every recipient: submitted ones are recorded or expire to unknown, the others
+            // stay due for mautic:ses:bulk retry. Throwing would make Mautic send the whole message again under new
+            // tracking hashes, which the outbox cannot recognise, so recipients SES accepted would get it twice.
+            $this->logger->error('SES bulk sending stopped after the recipients were saved; mautic:ses:bulk retry submits the ones left.', ['email_id' => $emailId, 'exception' => $e]);
+
+            return;
+        }
+        $this->logger->info('SES transport batch persisted and processed.', ['email_id' => $emailId, 'bulk' => 'auto']);
+    }
+
+    /**
+     * Requests of a full window can leave together, because the SDK only sends a queued request when the sender waits
+     * for a response. Limiting each request to ratelimit / bulk_concurrency recipients keeps such a burst within one
+     * second of the send rate, the most the shared token bucket holds.
+     *
+     * @return array{int, int} recipients per request, requests in flight
+     */
+    private function bulkWindow(): array
+    {
         $rate = max(1, (int) ($this->settings['maxSendRate'] ?? 14));
-        $limit = min(50, $rate, (int) ($this->settings['bulkBatchSize'] ?? 50));
         $concurrency = max(1, (int) ($this->settings['bulkConcurrency'] ?? 2));
-        // One send() call for all batches keeps up to $concurrency requests in flight. Each batch is persisted before the sender claims it.
-        $batches = (function () use ($scope, $limit): \Generator {
-            foreach ((new BulkBatcher())->batches($this->bulkDeliveries($scope), $limit) as $batch) {
-                $ids = [];
-                foreach ($batch as $delivery) {
-                    $ids[] = $this->deliveryStore->enqueue($delivery, $scope);
-                }
-                yield $ids;
-            }
-        })();
-        $this->bulkSender->send($this->client, $batches, fn (int $recipients) => $this->acquireRecipientQuota($recipients), $concurrency);
-        $this->logger->info('SES transport batch persisted and processed.', ['email_id' => $this->getEmailIdFromMetadata($this->message->getMetadata()), 'bulk' => 'auto']);
+
+        return [min(50, (int) ($this->settings['bulkBatchSize'] ?? 50), max(1, intdiv($rate, $concurrency))), $concurrency];
     }
 
     /** Retry commands and first submissions share precisely the same limiter. */
@@ -355,8 +372,7 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
                 yield ['id' => $row['id'], 'email_id' => $row['email_id'], 'operation' => $content['operation'], 'common' => $content['payload'], 'entry' => json_decode($row['entry'], true, 512, JSON_THROW_ON_ERROR)];
             }
         })();
-        $count = min(50, max(1, (int) ($this->settings['maxSendRate'] ?? 14)), (int) ($this->settings['bulkBatchSize'] ?? 50));
-        $concurrency = max(1, (int) ($this->settings['bulkConcurrency'] ?? 2));
+        [$count, $concurrency] = $this->bulkWindow();
         // One send() call for all batches keeps up to $concurrency requests in flight.
         $batches = (static function (\Generator $batches): \Generator {
             foreach ($batches as $batch) {
@@ -423,6 +439,14 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
         MailHelper::searchReplaceTokens(array_keys($tokens), $tokens, $headers);
         $common = [];
         $this->addSesHeaders($common, $headers, $data);
+        // Mautic sets Return-Path from the custom return path or a bounce address. SES uses that header of a raw message
+        // only as the address for bounce and complaint notifications, and SendBulkEmail takes that address as a parameter.
+        if ($returnPath = $headers->getReturnPath()) {
+            if (isset($common['FeedbackForwardingEmailAddress']) && 0 !== strcasecmp($common['FeedbackForwardingEmailAddress'], $returnPath->getEncodedAddress())) {
+                throw new IneligibleMessage('return_path_conflict');
+            }
+            $common['FeedbackForwardingEmailAddress'] = $returnPath->getEncodedAddress();
+        }
         $tags = $common['EmailTags'] ?? [];
         unset($common['EmailTags']);
         $tags = $this->deliveryTag($tags, $id);
@@ -468,12 +492,24 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
                 }
                 continue;
             }
+            // Sent as FeedbackForwardingEmailAddress by bulkEntry().
+            if ('return-path' === strtolower($name)) {
+                continue;
+            }
             if (!preg_match('/^(x-|list-)/i', $name) && !in_array(strtolower($name), ['precedence', 'feedback-id', 'auto-submitted'], true)) {
                 throw new IneligibleMessage('unsupported_header');
             }
             $value = $header->getBodyAsString();
+            // Mautic removes a custom header whose tokens resolve to nothing; SES requires a value.
+            if ('' === $value) {
+                continue;
+            }
             if (strlen($name) > 126 || strlen($value) > 870 || preg_match('/[\r\n]/', $value)) {
                 throw new IneligibleMessage('header_size_or_folding');
+            }
+            // SES accepts printable ASCII only, without space or colon in the name (a tab in a value, for example, is refused).
+            if (!preg_match('/^[!-9;-~]+$/D', $name) || !preg_match('/^[ -~]+$/D', $value)) {
+                throw new IneligibleMessage('header_value');
             }
             $result[] = ['Name' => $name, 'Value' => $value];
         }

@@ -13,6 +13,8 @@ use GuzzleHttp\Promise\Promise;
 use MauticPlugin\AmazonSesBundle\Mailer\Bulk\BulkSender;
 use MauticPlugin\AmazonSesBundle\Mailer\Bulk\DeliveryStore;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\AbstractLogger;
+use Psr\Log\LogLevel;
 use Psr\Log\NullLogger;
 
 class BulkSenderTest extends TestCase
@@ -131,6 +133,105 @@ class BulkSenderTest extends TestCase
         }
         // The first request was already in flight and is recorded; the failing group and the untried third are released.
         self::assertSame(['accepted', 'retry', 'retry'], array_map(static fn (string $id): string => self::state($em, $id), $ids));
+        // Nothing of the released groups reached SES, so their claims do not count as attempts.
+        self::assertSame([1, 0, 0], array_map(static fn (string $id): int => (int) $em->getConnection()->fetchOne('SELECT attempts FROM ses_bulk_deliveries WHERE id = ?', [$id]), $ids));
+    }
+
+    public function testLocalFailuresDoNotSpendAttempts(): void
+    {
+        $calls = 0;
+        $client = self::client(static function () use (&$calls) {
+            ++$calls;
+
+            return Create::promiseFor(new Result(['BulkEmailEntryResults' => [['Status' => 'SUCCESS', 'MessageId' => 'id']]]));
+        });
+        $em = DeliveryStoreTest::manager();
+        $store = new DeliveryStore($em);
+        $store->install();
+        $id = $store->enqueue(DeliveryStoreTest::delivery(), BulkSender::scope($client));
+        $sender = new BulkSender($store, new NullLogger());
+        // More consecutive failures than a row has attempts, as when every retry run finds the cache directory unwritable.
+        for ($run = 1; $run <= 5; ++$run) {
+            try {
+                $sender->send($client, [[$id]], static function (): void {
+                    throw new \RuntimeException('Token bucket unavailable');
+                });
+                self::fail('The local failure must propagate.');
+            } catch (\RuntimeException $e) {
+                self::assertSame('Token bucket unavailable', $e->getMessage());
+            }
+            $row = $em->getConnection()->fetchAssociative('SELECT state, reason, attempts FROM ses_bulk_deliveries');
+            self::assertSame(['retry', 'local_preflight_failure', 0], [$row['state'], $row['reason'], (int) $row['attempts']]);
+            $em->getConnection()->executeStatement('UPDATE ses_bulk_deliveries SET next_attempt = 0');
+        }
+        self::assertSame(0, $calls);
+
+        $sender->send($client, [[$id]], static fn () => null);
+        self::assertSame(1, $calls);
+        self::assertSame('accepted', self::state($em, $id));
+    }
+
+    public function testDailyQuotaIsRetriedHourlyWithoutSpendingAttempts(): void
+    {
+        $client = self::client(static fn () => Create::promiseFor(new Result(['BulkEmailEntryResults' => [['Status' => 'ACCOUNT_DAILY_QUOTA_EXCEEDED', 'Error' => 'Daily quota']]])));
+        $em = DeliveryStoreTest::manager();
+        $db = $em->getConnection();
+        $store = new DeliveryStore($em);
+        $store->install();
+        $id = $store->enqueue(DeliveryStoreTest::delivery(), BulkSender::scope($client));
+        $sender = new BulkSender($store, new NullLogger());
+        for ($run = 1; $run <= 5; ++$run) {
+            $sender->send($client, [[$id]], static fn () => null);
+            $row = $db->fetchAssociative('SELECT state, reason, attempts, next_attempt FROM ses_bulk_deliveries');
+            self::assertSame(['retry', 'ACCOUNT_DAILY_QUOTA_EXCEEDED', 0], [$row['state'], $row['reason'], (int) $row['attempts']]);
+            self::assertGreaterThanOrEqual(time() + 3599, (int) $row['next_attempt']);
+            $db->executeStatement('UPDATE ses_bulk_deliveries SET next_attempt = 0');
+        }
+
+        // Past the deferral window the quota is an ordinary retryable failure again.
+        $db->executeStatement('UPDATE ses_bulk_deliveries SET created_at = ?', [time() - BulkSender::QUOTA_DEFERRAL - 1]);
+        $sender->send($client, [[$id]], static fn () => null);
+        $row = $db->fetchAssociative('SELECT state, attempts, next_attempt FROM ses_bulk_deliveries');
+        self::assertSame(['retry', 1], [$row['state'], (int) $row['attempts']]);
+        self::assertLessThanOrEqual(time() + 60, (int) $row['next_attempt']);
+    }
+
+    /**
+     * @dataProvider loggedOutcomes
+     */
+    public function testRecipientsThatNeedAttentionAreLoggedAsErrors(callable $respond, string $level, array $outcomes): void
+    {
+        $client = self::client(static fn ($command) => $respond($command));
+        $store = new DeliveryStore(DeliveryStoreTest::manager());
+        $store->install();
+        $id = $store->enqueue(DeliveryStoreTest::delivery(), BulkSender::scope($client));
+        $logger = new class() extends AbstractLogger {
+            public array $records = [];
+
+            public function log($level, $message, array $context = []): void
+            {
+                $this->records[] = [$level, $context];
+            }
+        };
+        (new BulkSender($store, $logger))->send($client, [[$id]], static fn () => null);
+
+        self::assertCount(1, $logger->records);
+        [$logged, $context] = $logger->records[0];
+        self::assertSame($level, $logged);
+        self::assertSame([42, 1, $outcomes], [$context['email_id'], $context['recipients'], $context['outcomes']]);
+        self::assertMatchesRegularExpression('/^[a-f0-9]{64}$/', $context['content_id']);
+    }
+
+    public static function loggedOutcomes(): array
+    {
+        $entry = static fn (array $result): callable => static fn () => Create::promiseFor(new Result(['BulkEmailEntryResults' => [$result]]));
+
+        return [
+            'accepted' => [$entry(['Status' => 'SUCCESS', 'MessageId' => 'id']), LogLevel::INFO, ['accepted' => ['' => 1]]],
+            'retry' => [$entry(['Status' => 'TRANSIENT_FAILURE']), LogLevel::WARNING, ['retry' => ['TRANSIENT_FAILURE' => 1]]],
+            'rejected' => [$entry(['Status' => 'MESSAGE_REJECTED']), LogLevel::ERROR, ['rejected' => ['MESSAGE_REJECTED' => 1]]],
+            'request failed' => [static fn ($command) => Create::rejectionFor(new AwsException('Internal error', $command, ['code' => 'InternalFailure'])), LogLevel::ERROR, ['unknown' => ['ambiguous_request_failure' => 1]]],
+        ];
     }
 
     public static function localFailures(): array

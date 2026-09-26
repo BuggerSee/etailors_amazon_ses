@@ -89,7 +89,7 @@ The port in `endpoint` must equal `FAKE_PORT`. Clear the cache after every DSN c
 | `FAKE_LOG`      | `<PHP sys_get_temp_dir()>/fake-ses-requests.jsonl`        | JSONL request log. The fake server's pid file and output are written next to it. |
 | `FAKE_SES_RATE` | `80`                                                      | `MaxSendRate` reported by the fake account endpoint.                            |
 | `STATE`         | `ses-e2e-state.json` next to `FAKE_LOG`                   | Seed state (`stamp`, `segment_id`, `email_id`, `contact_ids`, `emails`).        |
-| `BATCH`         | `100` (`500` in `bench.sh`)                               | Contacts per `mautic:broadcasts:send` batch.                                    |
+| `BATCH`         | `100` (`500` in `bench.sh`)                               | Contacts per `mautic:broadcasts:send` batch; `verify` uses it to count the expected requests. |
 | `WORKERS`       | `2`                                                       | `messenger:consume email` processes that `async` runs in parallel.              |
 
 `seed.php` also reads `SEED_HTML_FILE` (send your own HTML instead of the built-in fixture; its plain text is derived
@@ -207,11 +207,11 @@ email, prints `PASS`/`FAIL` per check and exits 1 when any check fails (2 on bad
 | every recipient went through the shared-template path                      | No recipient fell back to raw sending (`operation = bulk`).                     |
 | no outbox row was claimed more than once before the retry runs (no flag only) | No row has `attempts > 1` right after the send. Each claim adds an attempt and a failed row is due again 60 s later at the earliest, so after `async` this proves that two workers never claimed the same delivery. |
 | bulk request N carries an inline template                                  | `SendBulkEmail` uses `DefaultContent.Template.TemplateContent` with subject and HTML. |
-| bulk request N has <=50 entries and one result per entry                   | Batches respect the SES entry limit.                                            |
+| bulk request N has <=L entries and one result per entry                    | Batches respect the per-request limit L: 50, `bulk_batch_size` or `ratelimit` / `bulk_concurrency` from `mailer_dsn`, whichever is smallest (40 with the DSN above). |
 | entry N renders and reconciles                                             | Per submission: the verifier substitutes `{{var}}` from the entry's replacement data and finds the recipient's address and tracking hash in the HTML, no unreplaced Mautic token (`{contactfield=…}`, `{unsubscribe_text}`, `{webview_text}`, `{tracking_pixel}`, `{trackable=…}`, `{leadfield=…}`), no leftover `{{`/missing variable, a `List-Unsubscribe` header with the recipient's hash, the `mautic_delivery_id` and `X-EMAIL-ID` tags, the fake status expected for that local part and attempt, the SES `MessageId` stored on accepted rows, and resubmission only after `TRANSIENT_FAILURE`/`ACCOUNT_THROTTLED`. At a recipient's latest submission it also checks the outbox state (and, for an exhausted retry, the reason `retry_exhausted:<status>`) and that the outbox attempt count equals the number of logged submissions. |
 | every seeded recipient appears exactly once across the initial bulk entries | The set of submitted addresses equals the seeded set; with the resubmission rule above, nothing was sent twice unless the outbox retried it. |
 | all bulk requests share one identical inline template                      | The content is shared by every batch and retries reuse the stored template.     |
-| initial request count equals ceil(recipients / 50)                         | Batches are full (holds when `BATCH` is a multiple of 50).                      |
+| initial request count equals ceil(recipients / L) per batch of `BATCH`     | Batches are full: each `mautic:broadcasts:send` batch of `BATCH` contacts is one message, split into requests of up to L recipients. |
 | Mautic recorded one email_stats row per recipient / every outbox row maps to an email_stats row | Mautic's statistics and the outbox agree by tracking hash.     |
 | sync-stats flagged exactly the rejected recipients as failed (`--after-sync`) | `email_stats.is_failed` count equals the number of `rejected` outbox rows.    |
 | no do-not-contact entries were created by transport failures               | Transport failures never mark the seeded contacts do-not-contact.               |

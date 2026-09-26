@@ -146,7 +146,7 @@ run() {
     status)    id="$(email_id)"; console mautic:ses:bulk status --email-id="$id" ;;
     retry)     retry "${2:-}" ;;
     sync)      console mautic:ses:bulk sync-stats ;;
-    verify)    shift; php "$HERE/verify.php" "$MAUTIC_ROOT" "$STATE" "$FAKE_LOG" "$@" ;;
+    verify)    shift; BATCH="$BATCH" FAKE_SES_RATE="${FAKE_SES_RATE:-80}" php "$HERE/verify.php" "$MAUTIC_ROOT" "$STATE" "$FAKE_LOG" "$@" ;;
     async)     async ;;
     all)
       run prepare

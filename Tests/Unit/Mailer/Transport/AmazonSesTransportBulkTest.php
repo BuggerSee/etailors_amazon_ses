@@ -19,8 +19,12 @@ use MauticPlugin\AmazonSesBundle\Mailer\Transport\AmazonSesTransport;
 use MauticPlugin\AmazonSesBundle\Tests\Unit\Mailer\Bulk\BulkSenderTest;
 use MauticPlugin\AmazonSesBundle\Tests\Unit\Mailer\Bulk\DeliveryStoreTest;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\AbstractLogger;
+use Psr\Log\LoggerInterface;
+use Psr\Log\LogLevel;
 use Psr\Log\NullLogger;
 use Symfony\Component\EventDispatcher\EventDispatcher;
+use Symfony\Component\Mailer\Exception\TransportException;
 use Symfony\Component\Mime\Address;
 
 class AmazonSesTransportBulkTest extends TestCase
@@ -217,7 +221,149 @@ class AmazonSesTransportBulkTest extends TestCase
         self::assertSame([['bulk', 'accepted', '', 2]], $this->recipients());
     }
 
-    private function transport(array $settings = [], bool $bulkServices = true): AmazonSesTransport
+    public function testFailureBeforeTheCommitReachesMauticAndLeavesNothingBehind(): void
+    {
+        // Saving the second recipient fails, for example with a lock wait timeout.
+        $this->em->getConnection()->executeStatement("CREATE TRIGGER fail_b BEFORE INSERT ON ses_bulk_deliveries WHEN NEW.tracking_hash = 'hash-b' BEGIN SELECT RAISE(ABORT, 'Lock wait timeout exceeded'); END");
+
+        // Symfony throttles a failed send twice, which would wait a second at the transport's one message per second.
+        $transport = $this->transport()->setMaxPerSecond(0);
+        try {
+            $transport->send($this->message());
+            self::fail('Mautic must learn that the message failed.');
+        } catch (TransportException $e) {
+            self::assertStringContainsString('Lock wait timeout exceeded', $e->getMessage());
+        }
+        // Nothing was submitted and nothing is left that the retry command would send next to Mautic's own resend.
+        self::assertSame([], $this->calls);
+        self::assertSame(0, (int) $this->em->getConnection()->fetchOne('SELECT COUNT(*) FROM ses_bulk_deliveries'));
+        self::assertSame(0, (int) $this->em->getConnection()->fetchOne('SELECT COUNT(*) FROM ses_bulk_contents'));
+    }
+
+    /**
+     * @dataProvider failuresAfterSubmission
+     */
+    public function testFailureAfterTheFirstRequestIsLeftToTheOutbox(string $trigger, array $operations, array $stateB): void
+    {
+        $this->em->getConnection()->executeStatement($trigger);
+        $logger = new class() extends AbstractLogger {
+            public array $errors = [];
+
+            public function log($level, $message, array $context = []): void
+            {
+                if (LogLevel::ERROR === $level) {
+                    $this->errors[] = (string) $message;
+                }
+            }
+        };
+
+        // Two requests, one at a time: the first is accepted before the second batch fails. Mautic keeps its statistics,
+        // so it will not send the message again under new tracking hashes.
+        $this->transport(['bulkBatchSize' => 1, 'bulkConcurrency' => 1], true, $logger)->send($this->message());
+
+        self::assertSame(['SES bulk sending stopped after the recipients were saved; mautic:ses:bulk retry submits the ones left.'], $logger->errors);
+        self::assertSame($operations, array_column($this->calls, 0));
+        $rows = $this->em->getConnection()->fetchAllAssociativeIndexed('SELECT tracking_hash, state, reason, attempts FROM ses_bulk_deliveries');
+        self::assertSame('accepted', $rows['hash-a']['state']);
+        self::assertSame($stateB, [$rows['hash-b']['state'], $rows['hash-b']['reason'], (int) $rows['hash-b']['attempts']]);
+    }
+
+    public static function failuresAfterSubmission(): array
+    {
+        return [
+            // Never submitted: released for the retry command without spending an attempt.
+            'before the second request' => ["CREATE TRIGGER fail_b BEFORE UPDATE OF requests ON ses_bulk_contents WHEN NEW.requests = 2 BEGIN SELECT RAISE(ABORT, 'Lock wait timeout exceeded'); END", ['SendBulkEmail'], ['retry', 'local_preflight_failure', 0]],
+            // Submitted, outcome not recorded: the claim expires to unknown and is never sent again.
+            'recording the second outcome' => ["CREATE TRIGGER fail_b BEFORE UPDATE ON ses_bulk_deliveries WHEN OLD.tracking_hash = 'hash-b' AND OLD.state = 'sending' BEGIN SELECT RAISE(ABORT, 'Server has gone away'); END", ['SendBulkEmail', 'SendBulkEmail'], ['sending', '', 1]],
+        ];
+    }
+
+    public function testTokenizedHeaderThatResolvesToNothingIsLeftOut(): void
+    {
+        $message = $this->message(['{contactfield=company}' => ''], ['{contactfield=company}' => 'ACME']);
+        $message->getHeaders()->addTextHeader('X-Company', '{contactfield=company}');
+        $this->transport()->send($message);
+
+        // As Mautic core does for custom headers; SES refuses an empty header value for the whole request.
+        self::assertSame(['SendBulkEmail'], array_column($this->calls, 0));
+        [$a, $b] = array_map(static fn (array $entry): array => array_column($entry['ReplacementHeaders'], 'Value', 'Name'), $this->calls[0][1]['BulkEmailEntries']);
+        self::assertSame('ACME', $a['X-Company']);
+        self::assertArrayNotHasKey('X-Company', $b);
+        self::assertSame([['bulk', 'accepted', '', 2]], $this->recipients());
+    }
+
+    public function testHeaderValueThatSesRefusesSendsThatRecipientRaw(): void
+    {
+        // Symfony leaves a tab unencoded, but SES only accepts printable ASCII.
+        $message = $this->message(['{contactfield=company}' => "Acme\tInc"], ['{contactfield=company}' => 'ACME']);
+        $message->getHeaders()->addTextHeader('X-Company', '{contactfield=company}');
+        $this->transport()->send($message);
+
+        self::assertSame(['SendBulkEmail', 'SendEmail'], array_column($this->calls, 0));
+        self::assertCount(1, $this->calls[0][1]['BulkEmailEntries']);
+        self::assertStringContainsString('<'.self::B.'>', $this->calls[1][1]['Content']['Raw']['Data']);
+        self::assertSame([['bulk', 'accepted', '', 1], ['raw', 'accepted', 'header_value', 1]], $this->recipients());
+    }
+
+    /**
+     * @dataProvider feedbackAddresses
+     */
+    public function testReturnPathIsSentAsFeedbackForwardingAddress(?string $feedbackHeader, array $operations): void
+    {
+        // Mautic sets Return-Path from the custom return path (mailer_return_path) or a bounce address.
+        $message = $this->message()->returnPath('bounces@example.test');
+        if (null !== $feedbackHeader) {
+            $message->getHeaders()->addTextHeader('X-SES-FEEDBACK-FORWARDING-EMAIL-ADDRESS', $feedbackHeader);
+        }
+        $this->transport()->send($message);
+
+        self::assertSame($operations, array_column($this->calls, 0));
+        foreach ($this->calls as [$operation, $request]) {
+            if ('SendBulkEmail' === $operation) {
+                self::assertSame('bounces@example.test', $request['FeedbackForwardingEmailAddress']);
+                foreach ($request['BulkEmailEntries'] as $entry) {
+                    self::assertNotContains('return-path', array_map('strtolower', array_column($entry['ReplacementHeaders'], 'Name')));
+                }
+            } else {
+                self::assertStringContainsString('Return-Path: <bounces@example.test>', $request['Content']['Raw']['Data']);
+            }
+        }
+    }
+
+    public static function feedbackAddresses(): array
+    {
+        return [
+            'return path only' => [null, ['SendBulkEmail']],
+            'same feedback address' => ['Bounces@example.test', ['SendBulkEmail']],
+            // Which of the two SES would use is not documented, so the email is sent as before.
+            'different feedback address' => ['feedback@example.test', ['SendEmail', 'SendEmail']],
+        ];
+    }
+
+    /**
+     * @dataProvider windowLimits
+     */
+    public function testWindowCarriesAtMostOneSecondOfTheSendRate(int $concurrency, array $entries): void
+    {
+        // A full bucket, so the test does not wait for tokens.
+        file_put_contents($this->cache.'/ses_token_bucket.json', json_encode(['tokens' => 4.0, 'last_time' => microtime(true)]));
+        $this->transport(['maxSendRate' => 4, 'bulkConcurrency' => $concurrency])->send($this->message());
+
+        self::assertSame($entries, array_map(static fn (array $call): int => count($call[1]['BulkEmailEntries']), $this->calls));
+        self::assertSame([['bulk', 'accepted', '', 2]], $this->recipients());
+    }
+
+    public static function windowLimits(): array
+    {
+        return [
+            // Two requests in flight may leave together: 2 x 2 recipients is one second at 4/s.
+            'window of two' => [2, [2]],
+            // Four requests in flight: one recipient each.
+            'window of four' => [4, [1, 1]],
+        ];
+    }
+
+    private function transport(array $settings = [], bool $bulkServices = true, ?LoggerInterface $logger = null): AmazonSesTransport
     {
         $paths = $this->createMock(PathsHelper::class);
         $paths->method('getSystemPath')->with('cache', true)->willReturn($this->cache);
@@ -230,7 +376,7 @@ class AmazonSesTransportBulkTest extends TestCase
             $emails,
             $paths,
             new EventDispatcher(),
-            new NullLogger(),
+            $logger ?? new NullLogger(),
             $settings + ['maxSendRate' => 80, 'batchMultiplier' => 10, 'bulk' => 'auto', 'bulkBatchSize' => 50],
             $bulkServices ? $this->store : null,
             $bulkServices ? new BulkSender($this->store, new NullLogger()) : null,
@@ -262,7 +408,7 @@ class AmazonSesTransportBulkTest extends TestCase
         return $answeredAtCall;
     }
 
-    private function message(array $tokensB = []): MauticMessage
+    private function message(array $tokensB = [], array $tokensA = []): MauticMessage
     {
         $message = (new MauticMessage())
             ->from(new Address('news@example.test', 'Newsroom'))
@@ -273,7 +419,7 @@ class AmazonSesTransportBulkTest extends TestCase
         $message->getHeaders()->addTextHeader('X-EMAIL-ID', '42');
         $message->getHeaders()->addTextHeader('X-SES-CONFIGURATION-SET', 'newsletter');
         $message->getHeaders()->addTextHeader('List-Unsubscribe', '<https://example.test/old>');
-        $message->addMetadata(self::A, ['name' => 'Reader A', 'emailId' => 42, 'hashId' => 'hash-a', 'tokens' => self::tokens('a')]);
+        $message->addMetadata(self::A, ['name' => 'Reader A', 'emailId' => 42, 'hashId' => 'hash-a', 'tokens' => $tokensA + self::tokens('a')]);
         $message->addMetadata(self::B, ['name' => 'Reader B', 'emailId' => 42, 'hashId' => 'hash-b', 'tokens' => $tokensB + self::tokens('b')]);
 
         return $message;

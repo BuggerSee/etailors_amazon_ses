@@ -205,12 +205,12 @@ bucket as raw sending, so bulk sending saves requests and upload volume; it does
 
 ### Options
 
-| DSN option         | Values                               | Default | Meaning                                                                                                                                                                                     |
-|--------------------|--------------------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `bulk`             | `off`, `auto`                        | `off`   | `auto` sends eligible emails through shared templates; `off` sends raw MIME only.                                                                                                           |
-| `bulk_batch_size`  | 1 to 50                              | `50`    | Maximum recipients per `SendBulkEmail` request. Requests are also limited to the effective send rate (`ratelimit` or the SES `MaxSendRate`) in recipients and to 1,000,000 bytes.           |
-| `bulk_concurrency` | 1 to 10                              | `2`     | Requests one sending process (or one `retry` run) keeps in flight.                                                                                                                          |
-| `endpoint`         | absolute `http://` or `https://` URL | not set | Replaces the regional SES API endpoint, for example with an SES VPC endpoint or the local fake server. URL-encode it in a DSN string; the Email Settings form encodes option values itself. |
+| DSN option         | Values                               | Default | Meaning                                                                                                                                                                                                                                  |
+|--------------------|--------------------------------------|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `bulk`             | `off`, `auto`                        | `off`   | `auto` sends eligible emails through shared templates; `off` sends raw MIME only.                                                                                                                                                        |
+| `bulk_batch_size`  | 1 to 50                              | `50`    | Maximum recipients per `SendBulkEmail` request. Requests are also limited to 1,000,000 bytes and to the effective send rate (`ratelimit` or the SES `MaxSendRate`) divided by `bulk_concurrency`, in recipients.                         |
+| `bulk_concurrency` | 1 to 10                              | `2`     | Requests one sending process (or one `retry` run) keeps in flight. They can reach SES at the same moment, so each carries at most send rate / `bulk_concurrency` recipients and a full window never exceeds one second of the send rate. |
+| `endpoint`         | absolute `http://` or `https://` URL | not set | Replaces the regional SES API endpoint, for example with an SES VPC endpoint or the local fake server. URL-encode it in a DSN string; the Email Settings form encodes option values itself.                                              |
 
 Other values are rejected when the transport is created. Example:
 
@@ -254,27 +254,36 @@ and 4 seconds) and nothing is written to the outbox. The transport logs
 `SES raw sending: message is not eligible for shared templates.` with the reason at `info` level, which Mautic's
 production log configuration does not write to `var/logs`.
 
-| Reason                        | Cause                                                                                                                                           |
-|-------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------|
-| `attachments`                 | The email has attachments.                                                                                                                      |
-| `cc_or_bcc`                   | The email has CC or BCC recipients.                                                                                                             |
-| `custom_mime`                 | The email has an explicit MIME body, for example a signed or encrypted one.                                                                     |
-| `charset`                     | The HTML or text part is not UTF-8.                                                                                                             |
-| `stream_body`, `empty_body`   | A body part is a stream, or the email has neither HTML nor text.                                                                                |
-| `literal_template_delimiters` | `{{` or `}}` appears in the subject, a body part or a resolved token value.                                                                     |
-| `unsupported_token`           | A token key is not of the form `{…}`, or a token value is an array or object.                                                                   |
-| `case_colliding_tokens`       | Two token keys differ only in case.                                                                                                             |
-| `unsupported_header`          | A header other than `X-*`, `List-*`, `Precedence`, `Feedback-ID`, `Auto-Submitted` and the address, subject, date, message ID and MIME headers. |
-| `sender_differs_from_from`    | A `Sender` header that differs from `From`. Mautic 7 sets `Sender` to the `From` address, which is supported.                                   |
-| `header_count`                | More than 15 of the supported headers.                                                                                                          |
+| Reason                        | Cause                                                                                                                                                                    |
+|-------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `attachments`                 | The email has attachments.                                                                                                                                               |
+| `cc_or_bcc`                   | The email has CC or BCC recipients.                                                                                                                                      |
+| `custom_mime`                 | The email has an explicit MIME body, for example a signed or encrypted one.                                                                                              |
+| `charset`                     | The HTML or text part is not UTF-8.                                                                                                                                      |
+| `stream_body`, `empty_body`   | A body part is a stream, or the email has neither HTML nor text.                                                                                                         |
+| `literal_template_delimiters` | `{{` or `}}` appears in the subject, a body part or a resolved token value.                                                                                              |
+| `unsupported_token`           | A token key is not of the form `{…}`, or a token value is an array or object.                                                                                            |
+| `case_colliding_tokens`       | Two token keys differ only in case.                                                                                                                                      |
+| `unsupported_header`          | A header other than `X-*`, `List-*`, `Precedence`, `Feedback-ID`, `Auto-Submitted`, `Sender`, `Return-Path` and the address, subject, date, message ID and MIME headers. |
+| `sender_differs_from_from`    | A `Sender` header that differs from `From`. Mautic 7 sets `Sender` to the `From` address, which is supported.                                                            |
+| `return_path_conflict`        | A `Return-Path` and an `X-SES-FEEDBACK-FORWARDING-EMAIL-ADDRESS` header with different addresses.                                                                        |
+| `header_count`                | More than 15 of the supported headers.                                                                                                                                   |
+
+Mautic adds `Return-Path` when **Custom return path (bounce) address** (`mailer_return_path`) is set in the email
+settings, and for some sends when bounce monitoring is enabled. SES uses that header of a raw message only as the
+address for bounce and complaint notifications, and `SendBulkEmail` does not accept it as a header, so bulk sending
+passes the address as the request's `FeedbackForwardingEmailAddress` instead. A custom header whose tokens resolve to
+an empty value for a recipient is left out for that recipient, as Mautic does for custom headers itself; SES refuses
+empty header values.
 
 When the first recipient passes and a later one does not, only that recipient is sent raw. The typical reasons are
 per recipient: `replacement_data_size` (replacement data over 262,144 bytes), `request_size` (a request with this
 recipient alone would exceed 1,000,000 bytes), `header_size_or_folding` (a header name over 126 bytes, or a value
-over 870 bytes or with a line break) and `invalid_utf8`. The token-related reasons above
-(`literal_template_delimiters` in a token value, `unsupported_token`, `case_colliding_tokens`) can also apply. Such
-a recipient gets the same raw MIME message as on the raw path, submitted as its own `SendEmail` request through the
-outbox, so `status` shows it with mode `raw` and the reason, and it gets the outbox's retry handling.
+over 870 bytes or with a line break), `header_value` (a header name or value with characters SES refuses: anything
+but printable ASCII, such as a tab in a contact field used in a custom header) and `invalid_utf8`. The token-related
+reasons above (`literal_template_delimiters` in a token value, `unsupported_token`, `case_colliding_tokens`) can also
+apply. Such a recipient gets the same raw MIME message as on the raw path, submitted as its own `SendEmail` request
+through the outbox, so `status` shows it with mode `raw` and the reason, and it gets the outbox's retry handling.
 
 ### The `mautic:ses:bulk` command
 
@@ -283,25 +292,38 @@ php bin/console mautic:ses:bulk install
 php bin/console mautic:ses:bulk status [--email-id=ID] [--json]
 php bin/console mautic:ses:bulk retry [--limit=N]
 php bin/console mautic:ses:bulk sync-stats [--limit=N]
+php bin/console mautic:ses:bulk prune [--older-than=DAYS] [--limit=N]
 ```
 
-| Action       | What it does                                                                                                                                                                                                                                                                                       |
-|--------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `install`    | Creates the outbox tables that do not exist yet. Safe to run again.                                                                                                                                                                                                                                |
-| `status`     | Recipients per mode (`bulk` or `raw`), submission state, SES event and reason, with their attempts, plus the requests and estimated request bytes per mode. `--email-id` limits it to one Mautic email; `--json` prints the same data as JSON. Only recipients recorded in the outbox are counted. |
-| `retry`      | Turns stale claims into `unknown`, resubmits due `pending` and `retry` rows, then reconciles statistics like `sync-stats`. It reads `mailer_dsn`, requires `bulk=auto` and handles the rows of every email sent with the same region and access key.                                               |
-| `sync-stats` | Sets `is_failed` on Mautic's email statistics for recipients that are `rejected` or whose SES event is `bounced`, `rejected` or `rendering_failed`. It adds no Do Not Contact entries.                                                                                                             |
+| Action       | What it does                                                                                                                                                                                                                                                                                                                                                |
+|--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `install`    | Creates the outbox tables that do not exist yet. Safe to run again.                                                                                                                                                                                                                                                                                         |
+| `status`     | Recipients per mode (`bulk` or `raw`), submission state, SES event and reason, with their attempts, plus the requests and estimated request bytes per mode. `--email-id` limits it to one Mautic email; `--json` prints the same data as JSON. Only recipients recorded in the outbox are counted.                                                          |
+| `retry`      | Turns stale claims into `unknown`, resubmits due `pending` and `retry` rows, then reconciles statistics like `sync-stats`. It reads `mailer_dsn`, requires `bulk=auto` and handles the rows of every email sent with the same region and access key.                                                                                                        |
+| `sync-stats` | Sets `is_failed` on Mautic's email statistics for recipients that are `rejected` or whose SES event is `bounced`, `rejected` or `rendering_failed`. It adds no Do Not Contact entries. A failed recipient that still has no email statistic a day later (for example, because the email was deleted) is no longer reconciled; the command reports how many. |
+| `prune`      | Deletes `accepted`, `rejected` and `unknown` rows last updated more than `--older-than` days ago (default 30), except failures not reconciled yet, and then the stored contents no row uses any more. Rows in `pending`, `sending` and `retry` are never deleted.                                                                                           |
 
-`--limit` (1 to 10000, default 1000) caps the recipients that one run resubmits and reconciles. After switching back
-to `bulk=off`, `retry` refuses to run and rows left in `retry` wait until `bulk=auto` is configured again;
-`sync-stats` keeps working.
+`--limit` (1 to 10000, default 1000) caps the recipients that one run resubmits and reconciles; `prune` deletes in
+batches of that many rows until nothing is left. After switching back to `bulk=off`, `retry` refuses to run and rows
+left in `retry` wait until `bulk=auto` is configured again; `sync-stats` and `prune` keep working.
 
-Run `retry` from cron every 5 minutes, as the same user as Mautic's other cron jobs and workers (the token bucket file
-is in Mautic's cache directory):
+Run `retry` from cron every 5 minutes and `prune` once a day, as the same user as Mautic's other cron jobs and workers
+(the token bucket file is in Mautic's cache directory):
 
 ```text
 */5 * * * * php /path/to/mautic/bin/console mautic:ses:bulk retry
+30 3 * * *  php /path/to/mautic/bin/console mautic:ses:bulk prune
 ```
+
+### Retention and personal data
+
+Each outbox row holds the recipient's address and name, every resolved token value (contact fields, tracked links,
+unsubscribe and web view links) and the recipient's headers, about 10 KB per recipient for the newsletter in the
+benchmark below. A recipient sent raw from the outbox also has its complete rendered message stored. Nothing is
+deleted without `prune`, so schedule it: a weekly 150,000-recipient newsletter otherwise adds about 1.5 GB a week.
+Deleting a contact in Mautic does not delete its outbox rows; they go with the first `prune` run after they are older
+than `--older-than`, so choose a value within the time you have to erase personal data. Keep it longer than you might
+retry failed Messenger messages (`messenger:failed:retry`), because a pruned recipient is no longer recognised as sent.
 
 ### Outcomes and retries
 
@@ -310,7 +332,7 @@ is in Mautic's cache directory):
 | `pending`  | Recorded, not submitted yet. The sending process submits it; `retry` submits rows that a stopped process left behind.                                                                                                                                                                                                                                 |
 | `sending`  | Claimed by a process; the request may be in flight.                                                                                                                                                                                                                                                                                                   |
 | `accepted` | SES accepted the recipient and returned a message ID.                                                                                                                                                                                                                                                                                                 |
-| `retry`    | A temporary failure: `ACCOUNT_THROTTLED`, `ACCOUNT_DAILY_QUOTA_EXCEEDED`, `TRANSIENT_FAILURE` or `FAILED` for the recipient, a throttling error for the whole request, or a local error before submission (`local_preflight_failure`).                                                                                                                |
+| `retry`    | A temporary failure: `ACCOUNT_THROTTLED`, `ACCOUNT_DAILY_QUOTA_EXCEEDED`, `TRANSIENT_FAILURE` or `FAILED` for the recipient, a throttling error for the whole request, or a local error before submission (`local_preflight_failure`), such as an unwritable token bucket file.                                                                       |
 | `rejected` | A permanent failure (for example `MESSAGE_REJECTED`, `MAIL_FROM_DOMAIN_NOT_VERIFIED` or `AccessDeniedException`), an SDK validation error (`sdk_validation`) or exhausted retries (`retry_exhausted:<status>`).                                                                                                                                       |
 | `unknown`  | SES may or may not have accepted it: a timeout, broken connection, HTTP 5xx or other error (`ambiguous_request_failure`), a result list that does not match the request (`invalid_result_count`), an unrecognized status (`unrecognized_result`), a raw send without message ID (`missing_result`), or an interrupted process (`worker_interrupted`). |
 
@@ -321,9 +343,22 @@ is in Mautic's cache directory):
 - Rows in `retry` are resubmitted only by `mautic:ses:bulk retry`. There are up to 3 retries, which become due 60 s,
   120 s and 240 s after the failed attempt; with the cron above, a retry runs up to 5 minutes after it becomes due.
   If the fourth attempt also ends in `retry`, the row becomes `rejected` with reason `retry_exhausted:<status>`.
+- Two cases do not use up attempts. A `local_preflight_failure` never reached SES; it is due again after 60 s. A
+  recipient over the SES 24-hour quota (`ACCOUNT_DAILY_QUOTA_EXCEEDED`) is retried every hour for 30 hours after it
+  was recorded, so `retry` sends it once the quota frees up; after that it is retried like the other temporary
+  failures. Compare the size of a campaign with `Max24HourSend` in the SES console before sending it.
 - A row still `sending` 10 minutes after its claim becomes `unknown` (`worker_interrupted`) when the next bulk send
   or `retry` run starts.
+- The sending process records every recipient of an email in one database transaction before the first request. If
+  that fails, nothing is recorded and Mautic treats the email as failed, as with raw sending. Once the recipients are
+  recorded, the outbox owns them: if the process fails later (a database error, an unwritable token bucket file), it
+  logs the error and reports the email as sent, and `retry` submits the recipients that were not submitted. Failing
+  the email then would make Mautic send it again to every recipient under new tracking hashes, so recipients SES
+  already accepted would get it twice.
 - Every submission, first attempt or retry, is charged against the shared token bucket per recipient.
+- Requests that leave recipients `rejected` or `unknown`, and failures after the recipients were recorded, are logged
+  at `error` level, which Mautic's production log keeps; requests that leave recipients in `retry` are logged at
+  `warning` level.
 - `sync-stats` and `retry` reconcile failed recipients into the `is_failed` flag of Mautic's email statistics without
   creating Do Not Contact entries. Mautic's own sent count includes every recipient handed to the transport. Bounce
   and complaint notifications still add Do Not Contact entries through the SNS callback, as before.
@@ -342,7 +377,8 @@ part of these numbers.
 | Peak memory of the sending process | 136 MB      | 631 MB     |
 
 With `ratelimit=80` and 100 ms of added latency per request (404 contacts), one process reached 57 recipients/s with
-`bulk=auto` and 27 recipients/s with `bulk=off`.
+`bulk=auto` and 27 recipients/s with `bulk=off`. That run still sent 50 recipients per request; with the default
+`bulk_concurrency=2`, requests now carry at most 40 recipients at `ratelimit=80`.
 
 ### Testing
 
