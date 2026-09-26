@@ -12,8 +12,7 @@ flowchart TB
   B --> C{"AmazonSesTransport::doSend()"}
   C -- "bulk=off (default)" --> R["Raw path, unchanged from 1.0.41<br/>one SendEmail per recipient<br/>CommandPool micro-batches + inline retries"]
   C -- "bulk=auto" --> G{"Gate"}
-  G -- "no recipient metadata<br/>(system mail)" --> R
-  G -- "message ineligible<br/>attachments, CC/BCC, custom MIME,<br/>non-UTF-8, unsupported header" --> R
+  G -- "no recipient metadata (system mail),<br/>or message ineligible: attachments, CC/BCC,<br/>custom MIME, non-UTF-8, unsupported header" --> R
   G -- "rows already in the outbox<br/>(queue replay)" --> O
   G -- "eligible" --> T["SharedTemplateCompiler<br/>ONE inline template per email<br/>per-recipient data only: v_ (HTML) / t_ (text) variables"]
   T --> E["bulkEntry() per recipient<br/>Destination, ReplacementHeaders (List-Unsubscribe...),<br/>ReplacementTags: X-EMAIL-ID + mautic_delivery_id"]
