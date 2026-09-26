@@ -160,6 +160,36 @@ us-west-2
 
 ---
 
+## Upgrading from 1.0.39 or earlier
+
+Two changes in this version affect every existing installation, whether or not bulk sending is used. Do them
+before clearing the cache, or bounce and complaint feedback stops silently.
+
+1. **The SNS callback now requires the topic ARN.** Add `sns_topic_arn=<your topic ARN>` to `mailer_dsn` (or
+   set `amazon_ses_sns_topic_arns` in Mautic's local configuration). Since 1.0.40 the callback checks the AWS
+   signature and the topic of every notification; without a configured topic it answers `403` to all of them, and
+   SNS does not retry a `403`, so bounces and complaints are lost.
+2. **Raw message delivery must be off on the SNS subscription.** A raw delivery carries no SNS envelope and no
+   signature, so it can never pass the check; the callback answers `400` ("Key Type error"). In the SNS console open
+   the subscription of `https://<your-mautic-instance-url>/mailer/callback`, choose *Edit* and clear
+   *Raw message delivery*. The subscription stays confirmed.
+
+Also:
+
+- The plugin needs `aws/aws-php-sns-message-validator` (`^1.10`). Composer installs it with the plugin; a manually
+  installed plugin needs `composer require aws/aws-php-sns-message-validator` in the Mautic root.
+- The Do Not Contact channel for soft bounces changed from `soft bounce` to `soft_bounce` in 1.0.37. Existing rows
+  keep the old value until you run `UPDATE lead_donotcontact SET channel = 'soft_bounce' WHERE channel = 'soft bounce';`
+  (with your table prefix).
+- `mautic:plugins:reload` (or **Install/Update Plugins**) can stop once with "There is no active transaction" while
+  it runs a plugin migration that creates tables, because MySQL and MariaDB commit `CREATE TABLE` immediately. The
+  tables are created; run the reload a second time and it completes.
+- Sending itself is unchanged: `bulk=off` is the default and keeps the raw MIME path. See
+  [Bulk sending with shared SES templates](#bulk-sending-with-shared-ses-templates-experimental) before enabling
+  `bulk=auto`; it has its own AWS prerequisites.
+
+---
+
 ## SNS Callback Configuration
 
 To receive feedback from Amazon SES regarding bounces and complaints, you need to set up Amazon SNS.
@@ -173,14 +203,23 @@ To receive feedback from Amazon SES regarding bounces and complaints, you need t
    ```
 
 4. Ensure your topic sends notifications for bounces, complaints, and delivery status.
-5. Ensure the exact topic ARN is configured as `sns_topic_arn` in the mailer DSN.
+5. On the subscription, keep **Raw message delivery** disabled (the default). The plugin needs the SNS envelope
+   with its signature; a raw delivery is answered `400`.
+6. Ensure the exact topic ARN is configured as `sns_topic_arn` in the mailer DSN.
    The plugin verifies the AWS signature and topic before processing any callback. A callback from another topic or
    with an invalid signature is answered `403` and logged at `warning` level with the reason. To check the signature,
    Mautic downloads the SNS signing certificate over HTTPS from `sns.<region>.amazonaws.com` (5-second timeout) and
    caches it for an hour; if the download fails, the callback is answered `503`, which makes SNS deliver it again
    later, and the failure is logged at `error` level.
-6. For classic identity-based SNS notifications, enable **Include original headers** for bounce and complaint notifications on the verified SES identity. Mautic uses the `X-EMAIL-ID` header to attribute feedback to the email statistics. Configuration-set event publishing can use the `X-EMAIL-ID` message tag added by this plugin instead.
-7. Test your callback configuration by sending test emails and reviewing Mautic logs to verify feedback is processed correctly.
+7. For classic identity-based SNS notifications, enable **Include original headers** for bounce and complaint notifications on the verified SES identity. Mautic uses the `X-EMAIL-ID` header to attribute feedback to the email statistics. Configuration-set event publishing can use the `X-EMAIL-ID` message tag added by this plugin instead.
+8. Test your callback configuration by sending test emails and reviewing Mautic logs to verify feedback is processed correctly.
+
+Feedback can reach the topic in two ways: the identity's *Feedback notifications* (bounce, complaint, delivery) and
+the event destination of a configuration set. With both enabled, every event arrives twice; the second one only
+updates the same Do Not Contact entry, but it doubles the callback traffic. Bulk sending needs the configuration set
+(its events carry the message tags), so once it is set up, remove the topic from the identity's feedback
+notifications, or at least from *Delivery*. SES may insist on a bounce and complaint destination on the identity;
+then keep those two and remove *Delivery* only.
 
 ---
 
@@ -189,9 +228,12 @@ To receive feedback from Amazon SES regarding bounces and complaints, you need t
 To avoid exceeding SES rate limits, this plugin automatically:
 
 - Caches the current `maxSendRate` returned by AWS SES.
-- Dynamically adjusts the batch size to match that rate.
-- Throttles outgoing email API calls using `usleep()`.
-- Allows overriding the send rate via `ratelimit` DSN option.
+- Dynamically adjusts the batch size to match that rate (`ratelimit` × `batchmultiplier` recipients per queue message).
+- Paces every submission, raw or bulk, with a token bucket shared by all workers through a file in Mautic's cache
+  directory. The bucket holds no burst allowance: a submission takes its tokens and waits until the debt is repaid at
+  the rate, so the first second of a send is paced like every other one, and several workers together never exceed
+  the rate.
+- Allows overriding the send rate via the `ratelimit` DSN option.
 
 This prevents common errors like `TooManyRequests` while maximizing throughput.
 
@@ -229,7 +271,10 @@ Clear Mautic's cache after changing the DSN.
 - `aws/aws-sdk-php` 3.325.1 or newer (the plugin requires `^3.325.1`). Older versions lack inline template
   support; eligible emails then fail with an error that asks you to update the SDK.
 - The IAM user also needs `ses:SendBulkEmail`. Without it SES answers `AccessDeniedException`, and the recipients
-  are recorded as `rejected`.
+  are recorded as `rejected`. If the policy restricts `Resource` to identity ARNs, add the configuration set as well
+  (`arn:aws:ses:<region>:<account>:configuration-set/*`): as soon as a configuration set applies to a send, SES
+  authorizes the request against it too, and a missing resource fails every send, raw sending included, with
+  `AccessDeniedException`.
 - The outbox tables `ses_bulk_contents` and `ses_bulk_deliveries` (with your Mautic table prefix). A new plugin
   installation creates them. An existing installation gets them from the plugin migration when
   `bin/console mautic:plugins:reload` (or **Install/Update Plugins**) runs after the plugin version increases, or
@@ -244,7 +289,9 @@ Clear Mautic's cache after changing the DSN.
 - An SES configuration set with an event destination that publishes `Send`, `Delivery`, `Bounce`, `Complaint`,
   `Reject` and `Rendering Failure` events to the SNS topic from [SNS Callback Configuration](#sns-callback-configuration).
   Apply it as the default configuration set of the sending identity, or add the custom header
-  `X-SES-CONFIGURATION-SET` with its name to the email. The plugin tags every delivery it records with
+  `X-SES-CONFIGURATION-SET` with its name to the email. The sending identity is the most specific verified identity
+  of the From address: when `news@example.com` is verified on its own, its default configuration set applies, not
+  the one of the domain `example.com`. The plugin tags every delivery it records with
   `mautic_delivery_id`, and these events are the only way an unknown outcome becomes known. `Rendering Failure` is
   also the only report of a template that SES could not render.
 
