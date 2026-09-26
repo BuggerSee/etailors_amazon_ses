@@ -283,7 +283,7 @@ auto  400       80         100       500    9         404                   6239
 off   400       80         100       500    404       404                   129108076  319574               14.95   4.36    0.23   216
 ```
 
-With throttling and latency one sender reached about 57 recipients/s with `bulk=auto` and about 27 recipients/s with
+With throttling and latency one sender reached about 51 recipients/s with `bulk=auto` and about 30 recipients/s with
 `bulk=off`. A bulk recipient cost about 15 KB of request body, and the request counts equal ceil(recipients / 50), so
 every batch but the remainder carried 50 entries. Before the plain-text part was shared, each bulk recipient carried
 its own copy of it (66 KB per recipient in total for this newsletter), and the 1 MB request limit kept the batches at
