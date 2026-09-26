@@ -16,6 +16,8 @@ final class DeliveryStore
     private string $deliveries;
     private string $contents;
     private bool $ready = false;
+    /** @var array<string, true> content ids this instance inserted or found present */
+    private array $contentIds = [];
 
     public function __construct(private EntityManagerInterface $entityManager)
     {
@@ -23,14 +25,30 @@ final class DeliveryStore
         $this->contents = $entityManager->getClassMetadata(BulkContent::class)->getTableName();
     }
 
+    /**
+     * Shared by install() and the plugin migration.
+     *
+     * @return string[] CREATE statements for whichever outbox tables do not exist yet
+     */
+    public static function createSchemaSql(EntityManagerInterface $entityManager): array
+    {
+        $manager = $entityManager->getConnection()->createSchemaManager();
+        $missing = [];
+        foreach ([BulkContent::class, BulkDelivery::class] as $class) {
+            $metadata = $entityManager->getClassMetadata($class);
+            if (!$manager->tablesExist([$metadata->getTableName()])) {
+                $missing[] = $metadata;
+            }
+        }
+
+        return $missing ? (new SchemaTool($entityManager))->getCreateSchemaSql($missing) : [];
+    }
+
     public function install(): void
     {
-        $manager = $this->entityManager->getConnection()->createSchemaManager();
-        foreach ([BulkContent::class, BulkDelivery::class] as $class) {
-            $metadata = $this->entityManager->getClassMetadata($class);
-            if (!$manager->tablesExist([$metadata->getTableName()])) {
-                (new SchemaTool($this->entityManager))->createSchema([$metadata]);
-            }
+        $db = $this->entityManager->getConnection();
+        foreach (self::createSchemaSql($this->entityManager) as $sql) {
+            $db->executeStatement($sql);
         }
         $this->ready = true;
     }
@@ -50,14 +68,18 @@ final class DeliveryStore
         $db = $this->entityManager->getConnection();
         $now = time();
         $contentId = hash('sha256', serialize([$scope, $delivery['operation'], $delivery['email_id'], $delivery['common']]));
-        try {
-            $db->insert($this->contents, [
-                'id' => $contentId, 'email_id' => $delivery['email_id'], 'scope' => $scope,
-                'operation' => $delivery['operation'], 'payload' => json_encode($delivery['common'], JSON_THROW_ON_ERROR),
-                'requests' => 0, 'request_bytes' => 0, 'created_at' => $now,
-            ]);
-        } catch (UniqueConstraintViolationException) {
-            // Common content is shared across recipients and workers.
+        // Recipients of one message share content: insert it once per instance instead of failing once per recipient.
+        if (!isset($this->contentIds[$contentId])) {
+            try {
+                $db->insert($this->contents, [
+                    'id' => $contentId, 'email_id' => $delivery['email_id'], 'scope' => $scope,
+                    'operation' => $delivery['operation'], 'payload' => json_encode($delivery['common'], JSON_THROW_ON_ERROR),
+                    'requests' => 0, 'request_bytes' => 0, 'created_at' => $now,
+                ]);
+            } catch (UniqueConstraintViolationException) {
+                // Common content is shared across recipients and workers.
+            }
+            $this->contentIds[$contentId] = true;
         }
         try {
             $db->insert($this->deliveries, [

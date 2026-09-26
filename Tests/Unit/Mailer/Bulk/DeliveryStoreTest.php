@@ -4,18 +4,21 @@ declare(strict_types=1);
 
 namespace MauticPlugin\AmazonSesBundle\Tests\Unit\Mailer\Bulk;
 
+use Doctrine\DBAL\Logging\Middleware;
 use Doctrine\ORM\EntityManager;
 use Doctrine\ORM\ORMSetup;
 use Doctrine\Persistence\Mapping\Driver\StaticPHPDriver;
 use MauticPlugin\AmazonSesBundle\Mailer\Bulk\DeliveryStore;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\AbstractLogger;
 
 class DeliveryStoreTest extends TestCase
 {
-    public static function manager(): EntityManager
+    public static function manager(array $middlewares = []): EntityManager
     {
         $config = ORMSetup::createConfiguration(true);
         $config->setMetadataDriverImpl(new StaticPHPDriver([dirname(__DIR__, 4).'/Entity']));
+        $config->setMiddlewares($middlewares);
 
         return EntityManager::create(['driver' => 'pdo_sqlite', 'memory' => true], $config);
     }
@@ -46,6 +49,31 @@ class DeliveryStoreTest extends TestCase
         $store->enqueue(self::delivery(), 'scope');
         self::assertNull($store->claim($id, 'scope', 'worker-b'));
         self::assertSame('accepted', $store->summary(42)['recipients'][0]['state']);
+    }
+
+    public function testSharedContentIsInsertedOncePerStore(): void
+    {
+        $log = new class() extends AbstractLogger {
+            public array $sql = [];
+
+            public function log($level, $message, array $context = []): void
+            {
+                $this->sql[] = $context['sql'] ?? '';
+            }
+        };
+        $em = self::manager([new Middleware($log)]);
+        $db = $em->getConnection();
+        $store = new DeliveryStore($em);
+        $store->install();
+        $store->enqueue(self::delivery('first'), 'scope');
+        $store->enqueue(self::delivery('second'), 'scope');
+        self::assertSame(1, (int) $db->fetchOne('SELECT COUNT(*) FROM ses_bulk_contents'));
+        self::assertCount(1, preg_grep('/^INSERT INTO ses_bulk_contents /', $log->sql));
+        // Another worker starts without the cache; its insert hits the existing row and is ignored.
+        (new DeliveryStore($em))->enqueue(self::delivery('third'), 'scope');
+        self::assertCount(2, preg_grep('/^INSERT INTO ses_bulk_contents /', $log->sql));
+        self::assertSame(1, (int) $db->fetchOne('SELECT COUNT(*) FROM ses_bulk_contents'));
+        self::assertSame(3, (int) $db->fetchOne('SELECT COUNT(*) FROM ses_bulk_deliveries'));
     }
 
     public function testExpiredClaimsAreUnknownNotRetryable(): void
