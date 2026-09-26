@@ -39,7 +39,25 @@ class SharedTemplateCompilerTest extends TestCase
             'unchanged text keeps tags' => ['{a}', '<b>{a}</b>', ['{a}' => '{a}']],
             'plain shared text' => ['{a}', 'Hello {a}', ['{a}' => 'World']],
             'static newsletter' => ['<h1>News</h1>', 'News', []],
+            'shared text with unsubscribe link' => ['<p>News</p>{unsubscribe_text}', 'Thanks for reading our newsletter, {contactfield=email}. {unsubscribe_text}', ['{contactfield=email}' => 'person@example.com', '{unsubscribe_text}' => '<a href="https://example.test/u/a">Unsubscribe</a> to no longer receive emails from us.']],
+            'unclosed tag before text' => ['{a}', '{a} Shared text follows.', ['{a}' => '<b']],
         ];
+    }
+
+    public function testTextPartIsSharedWhenStrippingIsDistributive(): void
+    {
+        [$html, $text, $tokens] = $this->cases()['shared text with unsubscribe link'];
+        $compiled = (new SharedTemplateCompiler())->compile((new MauticMessage())->subject('News')->html($html)->text($text), $tokens);
+        self::assertStringContainsString('Thanks for reading our newsletter, ', $compiled['template']['Text']);
+        self::assertStringContainsString('{{t_', $compiled['template']['Text']);
+        self::assertArrayNotHasKey('ses_plain_text', json_decode($compiled['data'], true, 512, JSON_THROW_ON_ERROR));
+    }
+
+    public function testTextPartFallsBackWhenStrippingIsNotDistributive(): void
+    {
+        [$html, $text, $tokens] = $this->cases()['unclosed tag before text'];
+        $compiled = (new SharedTemplateCompiler())->compile((new MauticMessage())->subject('News')->html($html)->text($text), $tokens);
+        self::assertSame('{{ses_plain_text}}', $compiled['template']['Text']);
     }
 
     public function testTemplateIsSharedAndDataDoesNotRepeatTheNewsletter(): void
@@ -51,6 +69,19 @@ class SharedTemplateCompilerTest extends TestCase
         $b = $compiler->compile($message, ['{contactfield=email}' => 'b@example.com']);
         self::assertSame($a['template'], $b['template']);
         self::assertLessThan(100, strlen($a['data']));
+        self::assertNotSame($a['data'], $b['data']);
+    }
+
+    public function testTextTemplateIsSharedAndDataDoesNotRepeatThePlainText(): void
+    {
+        $text = str_repeat('Same newsletter sentence for everyone. ', 3000).'{unsubscribe_text}';
+        $message = (new MauticMessage())->subject('News')->html('<p>News</p>{unsubscribe_text}')->text($text);
+        $compiler = new SharedTemplateCompiler();
+        $a = $compiler->compile($message, ['{unsubscribe_text}' => '<a href="https://example.test/u/a">Unsubscribe</a>']);
+        $b = $compiler->compile($message, ['{unsubscribe_text}' => '<a href="https://example.test/u/b">Unsubscribe</a>']);
+        self::assertSame($a['template']['Text'], $b['template']['Text']);
+        self::assertLessThan(300, strlen($a['data']));
+        self::assertLessThan(300, strlen($b['data']));
         self::assertNotSame($a['data'], $b['data']);
     }
 

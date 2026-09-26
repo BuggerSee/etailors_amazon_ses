@@ -77,14 +77,19 @@ final class SharedTemplateCompiler
         if (!isset($this->cache[$cacheKey])) {
             $map = [];
             foreach ($keys as $key) {
-                $map[$key] = 'v_'.substr(hash('sha256', $key), 0, 24);
+                $map[$key] = substr(hash('sha256', $key), 0, 24);
             }
             $template = [];
             $used = [];
+            $textUsed = [];
             foreach ($source as $part => $value) {
-                foreach ($map as $key => $variable) {
+                foreach ($map as $key => $hash) {
+                    // The text part gets its own variables because their values may be tag-stripped.
+                    $variable = ('Text' === $part ? 't_' : 'v_').$hash;
                     $value = str_ireplace($key, '{{'.$variable.'}}', $value, $count);
-                    if ($count) {
+                    if ($count && 'Text' === $part) {
+                        $textUsed[$variable] = $key;
+                    } elseif ($count) {
                         $used[$variable] = $key;
                     }
                 }
@@ -93,9 +98,9 @@ final class SharedTemplateCompiler
             if (count($this->cache) >= 32) {
                 $this->cache = [];
             }
-            $this->cache[$cacheKey] = [$template, $used];
+            $this->cache[$cacheKey] = [$template, $used, $textUsed];
         }
-        [$template, $used] = $this->cache[$cacheKey];
+        [$template, $used, $textUsed] = $this->cache[$cacheKey];
         $data = [];
         foreach ($used as $variable => $key) {
             $data[$variable] = $resolved[$key];
@@ -104,10 +109,24 @@ final class SharedTemplateCompiler
         // Preserve that rule for HTML fragments and tag boundaries spanning tokens.
         if (isset($source['Text'])) {
             $text = str_ireplace($keys, $values, $source['Text']);
-            if ($text !== $source['Text'] && str_contains($text, '<')) {
-                $template['Text'] = '{{ses_plain_text}}';
-                $data['ses_plain_text'] = strip_tags($text);
+            $strip = $text !== $source['Text'] && str_contains($text, '<');
+            $textData = [];
+            $placeholders = [];
+            foreach ($textUsed as $variable => $key) {
+                $textData[$variable] = $strip ? strip_tags($resolved[$key]) : $resolved[$key];
+                $placeholders['{{'.$variable.'}}'] = $textData[$variable];
             }
+            // Stripping each value keeps the text shared only when it equals stripping the whole text.
+            if ($strip) {
+                $expected = strip_tags($text);
+                $candidate = strtr($template['Text'], $placeholders);
+                if ($candidate !== $expected) {
+                    $template['Text'] = '{{ses_plain_text}}';
+                    $data['ses_plain_text'] = $expected;
+                    $textData = [];
+                }
+            }
+            $data += $textData;
         }
         try {
             $json = json_encode((object) $data, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
