@@ -72,6 +72,15 @@ class CallbackSubscriberTest extends TestCase
         self::assertSame('delivered', $this->store->summary()['recipients'][0]['event']);
     }
 
+    public function testNestedNotificationErrorPropagates(): void
+    {
+        // The inner type is read from notificationType (or eventType), so the nested Notification is marked that way.
+        $result = $this->subscriber->processJsonPayload(self::notification(['notificationType' => 'Notification', 'Message' => 'not json']), 'Notification');
+
+        self::assertTrue($result['hasError']);
+        self::assertSame('mautic.amazonses.plugin.sns.callback.notification.json_invalid', $result['message']);
+    }
+
     /**
      * @dataProvider sesEventTypesWithoutContactAction
      */
