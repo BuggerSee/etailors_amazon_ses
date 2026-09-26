@@ -104,7 +104,7 @@ class AmazonSesTransportBulkTest extends TestCase
 
         self::assertSame(['SendEmail', 'SendEmail'], array_column($this->calls, 0));
         $recipients = array_map(
-            static fn (array $call): array => array_values(array_filter([self::A, self::B], static fn (string $email): bool => str_contains($call[1]['Content']['Raw']['Data'], $email))),
+            static fn (array $call): array => array_values(array_filter([self::A, self::B], static fn (string $email): bool => str_contains($call[1]['Content']['Raw']['Data'], '<'.$email.'>'))),
             $this->calls
         );
         sort($recipients);
@@ -136,7 +136,7 @@ class AmazonSesTransportBulkTest extends TestCase
 
         self::assertSame(['SendBulkEmail', 'SendEmail'], array_column($this->calls, 0));
         self::assertCount(1, $this->calls[0][1]['BulkEmailEntries']);
-        self::assertStringContainsString(self::B, $this->calls[1][1]['Content']['Raw']['Data']);
+        self::assertStringContainsString('<'.self::B.'>', $this->calls[1][1]['Content']['Raw']['Data']);
         self::assertSame([['bulk', 'accepted', '', 1], ['raw', 'accepted', 'literal_template_delimiters', 1]], $this->recipients());
     }
 
