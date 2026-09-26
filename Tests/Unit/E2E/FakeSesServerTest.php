@@ -61,6 +61,26 @@ class FakeSesServerTest extends TestCase
         ], array_slice($results, 1));
     }
 
+    public function testFlakyAddressFailsOnlyItsFirstRequest(): void
+    {
+        $log = sys_get_temp_dir().'/fake-ses-test-'.bin2hex(random_bytes(8)).'.jsonl';
+
+        try {
+            // A new server per request, as under PHP's built-in web server: the state must live in the file.
+            $first = (new FakeSesServer(80, $log))->handle('POST', '/v2/email/outbound-bulk-emails', self::bulkBody(['flaky@one.example.test']));
+            $second = (new FakeSesServer(80, $log))->handle('POST', '/v2/email/outbound-bulk-emails', self::bulkBody(['FLAKY@one.example.test', 'Flaky <flaky@two.example.test>', 'ok@example.test']));
+            $third = (new FakeSesServer(80, $log))->handle('POST', '/v2/email/outbound-bulk-emails', self::bulkBody(['flaky@two.example.test']));
+            self::assertFileExists($log.'.state.json');
+        } finally {
+            @unlink($log);
+            @unlink($log.'.state.json');
+        }
+
+        self::assertSame(['TRANSIENT_FAILURE'], self::statuses($first));
+        self::assertSame(['SUCCESS', 'TRANSIENT_FAILURE', 'SUCCESS'], self::statuses($second));
+        self::assertSame(['SUCCESS'], self::statuses($third));
+    }
+
     public function testHttp500RecipientFailsTheWholeBulkRequest(): void
     {
         $response = (new FakeSesServer())->handle('POST', '/v2/email/outbound-bulk-emails', self::bulkBody(['ok@example.test', 'http500@example.test']));
@@ -88,6 +108,18 @@ class FakeSesServerTest extends TestCase
         self::assertSame(404, $response['status']);
         self::assertSame('application/json', $response['headers']['Content-Type']);
         self::assertSame(['message' => 'Unknown operation'], json_decode($response['body'], true));
+    }
+
+    /**
+     * @param array{status: int, headers: array<string, string>, body: string} $response
+     *
+     * @return list<string>
+     */
+    private static function statuses(array $response): array
+    {
+        self::assertSame(200, $response['status']);
+
+        return array_column(json_decode($response['body'], true)['BulkEmailEntryResults'], 'Status');
     }
 
     /**
