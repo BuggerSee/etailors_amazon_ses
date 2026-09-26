@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+### Added
+- Experimental bulk sending with shared SES templates, off by default. With the DSN option `bulk=auto`, eligible emails are sent with `SendBulkEmail`: one inline template per request, each recipient's resolved Mautic tokens as replacement data and up to 50 recipients per request (`bulk_batch_size`, 1 to 50, default 50; `bulk_concurrency`, 1 to 10, default 2). Every recipient of an email is recorded in a delivery outbox in one transaction before the first request, charged against the shared token bucket and classified from its own SES result; once recorded, later failures are logged and left to the outbox's retry instead of failing the email. A request carries at most `ratelimit` / `bulk_concurrency` recipients, so the requests in flight never exceed one second of the send rate. Emails and recipients that cannot use a shared template fall back to raw sending before anything is submitted; a `Return-Path` header becomes the SES feedback forwarding address. SES events tagged with `mautic_delivery_id` update the outbox. An email without its own From address keeps the From address Mautic resolved, also when Mautic sets a `Return-Path` (with `bulk=off` the plugin still takes the envelope sender, which is then the `Return-Path` address). The outbox is scoped to the SES region, so rotating the access key keeps every recorded recipient. See the README section "Bulk sending with shared SES templates (experimental)".
+- `mautic:ses:bulk` console command with the actions `install`, `status`, `retry`, `sync-stats` and `prune` (deletes finished outbox rows after a retention period, 30 days by default).
+- Plugin migration `Version_1_0_42`, which creates the outbox tables `ses_bulk_contents` and `ses_bulk_deliveries` on `mautic:plugins:reload` once the plugin version is raised.
+- `endpoint` DSN option to replace the regional SES API endpoint with an absolute http(s) URL (URL-encoded in a DSN string).
+
+### Changed
+- Inline retries on the raw path now charge the shared token bucket, like first attempts.
+- Errors from a nested SNS `Notification` message now propagate to the callback's HTTP response instead of being answered with success.
+- SES event types `Send`, `Reject` and `Rendering Failure` are accepted by the callback and no longer logged as unknown.
+- The SNS callback downloads the signing certificate through Symfony HttpClient with a 5-second timeout and caches it for an hour. When the certificate cannot be downloaded, the callback is now answered `503`, which SNS retries, instead of `403`, which made SNS drop the bounce or complaint for good; rejected callbacks are logged with the reason.
+- `aws/aws-sdk-php` requirement raised to `^3.325.1`, the first version whose SES v2 model supports inline template content.
+- The bulk outbox keeps a recipient's request data (and a raw recipient's message) only until the recipient is `accepted`, `rejected` or `unknown`, leaving about 1 KB of bookkeeping per row; it saves recipients with up to 200 rows (and about 4 MB of request data) per `INSERT`, and `ses_bulk_deliveries` gets a `(state, updated_at)` index, which `mautic:ses:bulk install` and the migration `Version_1_0_42` also add to existing outbox tables.
+
 ## [1.0.41] - 2026-09-25
 - `CallbackSubscriber` now unescapes Mautic's `%%` in `mailer_dsn` before parsing it, so an `sns_topic_arn` DSN option saved through the Email settings UI (stored as `arn%%3Aaws%%3A...`) matches the SNS `TopicArn` instead of decoding to `arn%:aws%:...` and rejecting every callback with 403.
 
