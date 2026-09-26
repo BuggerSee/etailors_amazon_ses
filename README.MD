@@ -329,7 +329,8 @@ The address, the token values, the headers and a raw recipient's stored message 
 can still be submitted (`pending`, `retry` or `sending`). When it becomes `accepted`, `rejected` or `unknown`, they are
 deleted and its row keeps only bookkeeping (IDs, tracking hash, state, SES event, reason, attempts and the SES message
 ID), about 1 KB with its indexes. The 10 KB per recipient above therefore apply to recipients still waiting for a
-submission; a sent newsletter of 150,000 recipients keeps about 150 MB until `prune` deletes it.
+submission; a sent newsletter of 150,000 recipients keeps about 150 MB until `prune` deletes it. A Messenger message
+that is processed again stores its raw recipients' messages again, and they stay until `prune` deletes them.
 
 ### Outcomes and retries
 

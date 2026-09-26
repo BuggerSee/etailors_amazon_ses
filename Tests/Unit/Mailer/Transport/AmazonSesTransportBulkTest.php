@@ -6,6 +6,7 @@ namespace MauticPlugin\AmazonSesBundle\Tests\Unit\Mailer\Transport;
 
 use Aws\Result;
 use Aws\SesV2\SesV2Client;
+use Doctrine\DBAL\Logging\Middleware;
 use Doctrine\ORM\EntityManager;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\EntityRepository;
@@ -187,6 +188,39 @@ class AmazonSesTransportBulkTest extends TestCase
         $entries = $this->calls[0][1]['BulkEmailEntries'];
         self::assertCount(1, $entries);
         self::assertSame($due, array_column($entries[0]['ReplacementTags'], 'Value', 'Name')['mautic_delivery_id']);
+    }
+
+    public function testRetryBulkSkipsRawDeliveriesMadeFinalElsewhereSinceTheyWereListed(): void
+    {
+        $log = DeliveryStoreTest::sqlLog();
+        $this->em = DeliveryStoreTest::manager([new Middleware($log)]);
+        $this->store = new DeliveryStore($this->em);
+        $this->store->install();
+        $scope = BulkSender::scope($this->client);
+        $ids = array_map(fn (string $name): string => $this->store->enqueue(DeliveryStoreTest::raw($name), $scope), ['raw a', 'raw b', 'raw c']);
+        $db = $this->em->getConnection();
+        $other = new DeliveryStore($this->em);
+        $completedElsewhere = null;
+        $this->client = BulkSenderTest::client(function ($command) use ($db, $other, $scope, &$completedElsewhere) {
+            $this->calls[] = [$command->getName(), $command->toArray()];
+            // When the first request reaches SES, another process completes the one delivery retryBulk() has not read yet.
+            if (null === $completedElsewhere) {
+                $completedElsewhere = $db->fetchOne("SELECT id FROM ses_bulk_deliveries WHERE state = 'pending' ORDER BY content_id, created_at, id");
+                $other->complete($other->claim($completedElsewhere, $scope, 'other-worker'), 'accepted', '', 'ses-other');
+            }
+
+            return Create::promiseFor(new Result(['MessageId' => 'raw-'.count($this->calls)]));
+        });
+
+        // A window of one: the SDK reaches SES only once the sender waits, and by then the second delivery is read.
+        self::assertSame(3, $this->transport(['bulkConcurrency' => 1])->retryBulk());
+        self::assertNotFalse($completedElsewhere);
+        $submitted = array_map(static fn (array $call): string => array_column($call[1]['EmailTags'], 'Value', 'Name')['mautic_delivery_id'], $this->calls);
+        self::assertEqualsCanonicalizing(array_values(array_diff($ids, [$completedElsewhere])), $submitted);
+        self::assertSame(['SendEmail', 'SendEmail'], array_column($this->calls, 0));
+        // Two claims by retryBulk() and one by the other process: the delivery read as final is not claimed.
+        self::assertCount(3, preg_grep("/^UPDATE ses_bulk_deliveries SET state = 'sending'/", $log->sql));
+        self::assertSame([['raw', 'accepted', '', 3]], $this->recipients());
     }
 
     /**

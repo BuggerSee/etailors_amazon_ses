@@ -58,6 +58,11 @@ final class BulkSender
                         $this->settle(...array_shift($inFlight));
                     }
                     $content = $this->store->content($contentId);
+                    if (null === $content['payload']) {
+                        // An SNS event made this raw delivery final since its claim, and the claim ended with it.
+                        unset($pending[$contentId]);
+                        continue;
+                    }
                     $entries = array_map(static fn (array $row): array => json_decode($row['entry'], true, 512, JSON_THROW_ON_ERROR), $rows);
                     if ('bulk' === $content['operation']) {
                         $request = BulkBatcher::request($content['payload'], $entries);

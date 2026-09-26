@@ -60,7 +60,7 @@ class DeliveryStoreTest extends TestCase
         }
     }
 
-    private static function sqlLog(): AbstractLogger
+    public static function sqlLog(): AbstractLogger
     {
         return new class() extends AbstractLogger {
             public array $sql = [];
@@ -219,6 +219,46 @@ class DeliveryStoreTest extends TestCase
             self::assertNotSame([], $store->content($row['content_id'])['payload']);
             self::assertIsArray(json_decode($row['entry'], true, 512, JSON_THROW_ON_ERROR));
         }
+    }
+
+    public function testDeliveryMadeFinalElsewhereSinceDueReadsAsDroppedContent(): void
+    {
+        $em = self::manager();
+        $store = new DeliveryStore($em);
+        $store->install();
+        $raw = $store->enqueue(self::raw('raw'), 'scope');
+        $bulk = $store->enqueue(self::delivery('bulk'), 'scope');
+        $due = array_column($store->due('scope', 100), null, 'id');
+        self::assertEqualsCanonicalizing([$raw, $bulk], array_keys($due));
+
+        // Another process, for example the sending worker, completes the raw delivery after due() listed it.
+        $other = new DeliveryStore($em);
+        $other->complete($other->claim($raw, 'scope', 'other-worker'), 'accepted', '', 'ses-id');
+
+        self::assertNull($store->content($due[$raw]['content_id'])['payload']);
+        self::assertNull($store->claim($raw, 'scope', 'worker'));
+        self::assertSame(self::delivery('bulk')['common'], $store->content($due[$bulk]['content_id'])['payload']);
+    }
+
+    public function testReplayAfterPruneRestoresTheRawContent(): void
+    {
+        $em = self::manager();
+        $db = $em->getConnection();
+        $store = new DeliveryStore($em);
+        $store->install();
+        $raw = self::raw('replayed');
+        $store->enqueueBatches([[$raw]], 'scope');
+        $store->complete($store->claim($raw['id'], 'scope', 'worker'), 'accepted', '', 'ses-id');
+        // The delivery is pruned. Its content is newer than the cutoff, as after an earlier replay, and stays.
+        $db->executeStatement('UPDATE ses_bulk_deliveries SET updated_at = ?', [time() - 31 * 86400]);
+        self::assertSame(['deliveries' => 1, 'contents' => 0], $store->prune(30));
+        self::assertSame('', $db->fetchOne('SELECT payload FROM ses_bulk_contents'));
+
+        // The same Messenger message is replayed: its delivery is saved again and needs the message.
+        $store->enqueueBatches([[$raw]], 'scope');
+        $due = $store->due('scope', 100);
+        self::assertSame([$raw['id']], array_column($due, 'id'));
+        self::assertSame($raw['common'], $store->content($due[0]['content_id'])['payload']);
     }
 
     public function testInstallAddsIndexesMissingFromExistingTables(): void

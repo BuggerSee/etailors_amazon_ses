@@ -369,6 +369,10 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
         $deliveries = (function () use ($due): \Generator {
             foreach ($due as $row) {
                 $content = $this->deliveryStore->content($row['content_id']);
+                if (null === $content['payload']) {
+                    // Another process made this raw delivery final since due() listed it, so its claim would fail anyway.
+                    continue;
+                }
                 yield ['id' => $row['id'], 'email_id' => $row['email_id'], 'operation' => $content['operation'], 'common' => $content['payload'], 'entry' => json_decode($row['entry'], true, 512, JSON_THROW_ON_ERROR)];
             }
         })();

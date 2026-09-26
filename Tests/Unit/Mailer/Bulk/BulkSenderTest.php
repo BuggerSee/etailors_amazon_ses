@@ -242,6 +242,33 @@ class BulkSenderTest extends TestCase
         ];
     }
 
+    public function testRawDeliveryMadeFinalSinceItsClaimIsNotSubmitted(): void
+    {
+        $em = DeliveryStoreTest::manager();
+        $store = new DeliveryStore($em);
+        $store->install();
+        $b = hash('sha256', 'b');
+        $calls = [];
+        // The SDK reaches SES once the sender waits for the first response, which happens after the second claim. An SNS
+        // event makes that second delivery final before its request is built.
+        $client = self::client(static function ($command) use ($store, $b, &$calls) {
+            $calls[] = array_column($command['EmailTags'], 'Value', 'Name')['mautic_delivery_id'];
+            $store->recordEvent(['mail' => ['messageId' => 'ses-b', 'tags' => ['mautic_delivery_id' => [$b]]]], 'Delivery');
+
+            return Create::promiseFor(new Result(['MessageId' => 'ses-'.count($calls)]));
+        });
+        $scope = BulkSender::scope($client);
+        $a = $store->enqueue(DeliveryStoreTest::raw('a'), $scope);
+        $store->enqueue(DeliveryStoreTest::raw('b'), $scope);
+
+        (new BulkSender($store, new NullLogger()))->send($client, [[$a], [$b]], static fn () => null, 1);
+        self::assertSame([$a], $calls);
+        $rows = $em->getConnection()->fetchAllAssociativeIndexed('SELECT id, state, attempts, message_id FROM ses_bulk_deliveries');
+        self::assertSame(['accepted', 1, 'ses-1'], [$rows[$a]['state'], (int) $rows[$a]['attempts'], $rows[$a]['message_id']]);
+        // One attempt: the claim came before the event.
+        self::assertSame(['accepted', 1, 'ses-b'], [$rows[$b]['state'], (int) $rows[$b]['attempts'], $rows[$b]['message_id']]);
+    }
+
     public function testBatchesWithTheSameContentAreNeverMerged(): void
     {
         $entries = [];

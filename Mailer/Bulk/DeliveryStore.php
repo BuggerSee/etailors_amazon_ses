@@ -145,6 +145,11 @@ final class DeliveryStore
             } catch (UniqueConstraintViolationException) {
                 // Common content is shared across recipients and workers. created_at is the last use, so prune keeps it.
                 $db->update($this->contents, ['created_at' => $now], ['id' => $contentId]);
+                if ('raw' === $delivery['operation']) {
+                    // A raw content dropped its message when its delivery became final. A replay after that delivery was
+                    // pruned saves it again as pending, which needs the message back.
+                    $db->executeStatement("UPDATE {$this->contents} SET payload = ? WHERE id = ? AND payload = ''", [json_encode($delivery['common'], JSON_THROW_ON_ERROR), $contentId]);
+                }
             }
             $this->contentIds[$contentId] = true;
         }
@@ -248,13 +253,17 @@ final class DeliveryStore
         );
     }
 
+    /**
+     * @return array<string, mixed> the content row, whose payload is null once the one delivery of a raw content is final;
+     *                              a caller that read that delivery before another process completed it skips it
+     */
     public function content(string $id): array
     {
         $row = $this->entityManager->getConnection()->fetchAssociative("SELECT * FROM {$this->contents} WHERE id = ?", [$id]);
         if (!$row) {
             throw new \RuntimeException('Missing persisted SES content.');
         }
-        $row['payload'] = json_decode($row['payload'], true, 512, JSON_THROW_ON_ERROR);
+        $row['payload'] = '' === $row['payload'] ? null : json_decode($row['payload'], true, 512, JSON_THROW_ON_ERROR);
 
         return $row;
     }
