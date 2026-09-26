@@ -325,6 +325,12 @@ Deleting a contact in Mautic does not delete its outbox rows; they go with the f
 than `--older-than`, so choose a value within the time you have to erase personal data. Keep it longer than you might
 retry failed Messenger messages (`messenger:failed:retry`), because a pruned recipient is no longer recognised as sent.
 
+The address, the token values, the headers and a raw recipient's stored message are needed only while the recipient
+can still be submitted (`pending`, `retry` or `sending`). When it becomes `accepted`, `rejected` or `unknown`, they are
+deleted and its row keeps only bookkeeping (IDs, tracking hash, state, SES event, reason, attempts and the SES message
+ID), about 1 KB with its indexes. The 10 KB per recipient above therefore apply to recipients still waiting for a
+submission; a sent newsletter of 150,000 recipients keeps about 150 MB until `prune` deletes it.
+
 ### Outcomes and retries
 
 | State      | Meaning                                                                                                                                                                                                                                                                                                                                               |

@@ -20,7 +20,8 @@ every step against the fake server's request log, the outbox tables and Mautic's
   `docroot/`), with this plugin in `docroot/plugins/AmazonSesBundle` (a symlink to this checkout works; the project
   then needs the plugin's Composer dependencies, for example
   `composer require aws/aws-php-sns-message-validator:^1.10 aws/aws-sdk-php:^3.325.1`).
-- The outbox tables. `run.sh prepare` creates them with `bin/console mautic:ses:bulk install`.
+- The outbox tables. `run.sh prepare` creates them with `bin/console mautic:ses:bulk install`, which also adds the
+  indexes that tables created by an earlier build of the plugin lack (such as `ses_bulk_state_updated`).
 - Synchronous email sending (`'messenger_dsn_email' => 'sync://'` in `config/local.php`). With a queued transport,
   `send` only queues the messages; run `bin/console messenger:consume email` before `status` and `verify`, or use
   `run.sh async`, which switches to a Doctrine queue and back by itself (see

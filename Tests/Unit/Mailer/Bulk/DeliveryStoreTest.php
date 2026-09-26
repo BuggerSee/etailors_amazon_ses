@@ -35,6 +35,43 @@ class DeliveryStoreTest extends TestCase
         ];
     }
 
+    /** A raw fallback delivery as the transport saves it: one content per recipient with its base64 MIME message. */
+    public static function raw(string $id): array
+    {
+        $delivery = self::delivery($id);
+        $delivery['operation'] = 'raw';
+        $delivery['common'] = [
+            'Destination' => $delivery['entry']['Destination'],
+            'Content' => ['Raw' => ['Data' => base64_encode("Subject: News\r\n\r\nHello {$id}")]],
+            'EmailTags' => [['Name' => 'mautic_delivery_id', 'Value' => $delivery['id']]],
+        ];
+        $delivery['entry'] = [];
+
+        return $delivery;
+    }
+
+    /** Creates the outbox tables as an earlier build did, without the given index. */
+    public static function installWithout(EntityManager $em, string $index): void
+    {
+        foreach (DeliveryStore::createSchemaSql($em) as $sql) {
+            if (!str_contains($sql, $index)) {
+                $em->getConnection()->executeStatement($sql);
+            }
+        }
+    }
+
+    private static function sqlLog(): AbstractLogger
+    {
+        return new class() extends AbstractLogger {
+            public array $sql = [];
+
+            public function log($level, $message, array $context = []): void
+            {
+                $this->sql[] = $context['sql'] ?? '';
+            }
+        };
+    }
+
     public function testInstallClaimAndReplay(): void
     {
         $em = self::manager();
@@ -53,14 +90,7 @@ class DeliveryStoreTest extends TestCase
 
     public function testSharedContentIsInsertedOncePerStore(): void
     {
-        $log = new class() extends AbstractLogger {
-            public array $sql = [];
-
-            public function log($level, $message, array $context = []): void
-            {
-                $this->sql[] = $context['sql'] ?? '';
-            }
-        };
+        $log = self::sqlLog();
         $em = self::manager([new Middleware($log)]);
         $db = $em->getConnection();
         $store = new DeliveryStore($em);
@@ -74,6 +104,135 @@ class DeliveryStoreTest extends TestCase
         self::assertCount(2, preg_grep('/^INSERT INTO ses_bulk_contents /', $log->sql));
         self::assertSame(1, (int) $db->fetchOne('SELECT COUNT(*) FROM ses_bulk_contents'));
         self::assertSame(3, (int) $db->fetchOne('SELECT COUNT(*) FROM ses_bulk_deliveries'));
+    }
+
+    public function testDeliveriesAreInsertedInChunksAndAReplayLeavesThemAsTheyAre(): void
+    {
+        $log = self::sqlLog();
+        $em = self::manager([new Middleware($log)]);
+        $db = $em->getConnection();
+        $store = new DeliveryStore($em);
+        $store->install();
+        $batches = array_chunk(array_map(static fn (int $i): array => self::delivery("recipient {$i}"), range(1, 450)), 50);
+        $ids = array_map(static fn (array $batch): array => array_column($batch, 'id'), $batches);
+        $inserts = static fn (): int => count(preg_grep('/^INSERT INTO ses_bulk_deliveries /', $log->sql));
+
+        self::assertSame($ids, $store->enqueueBatches($batches, 'scope'));
+        self::assertSame(3, $inserts());
+        self::assertSame(450, (int) $db->fetchOne('SELECT COUNT(*) FROM ses_bulk_deliveries'));
+
+        $db->executeStatement("UPDATE ses_bulk_deliveries SET state = 'accepted', reason = 'first outcome'");
+        $log->sql = [];
+        // No delivery insert is wrapped in a catch on SQLite: a failing one would throw here and roll the message back.
+        self::assertSame($ids, $store->enqueueBatches($batches, 'scope'));
+        self::assertSame(3, $inserts());
+        self::assertSame(450, (int) $db->fetchOne('SELECT COUNT(*) FROM ses_bulk_deliveries'));
+        self::assertSame(450, (int) $db->fetchOne("SELECT COUNT(*) FROM ses_bulk_deliveries WHERE state = 'accepted' AND reason = 'first outcome'"));
+    }
+
+    public function testLargeEntriesEndAStatementEarly(): void
+    {
+        $log = self::sqlLog();
+        $em = self::manager([new Middleware($log)]);
+        $store = new DeliveryStore($em);
+        $store->install();
+        $batch = [];
+        foreach (range(1, 5) as $i) {
+            $delivery = self::delivery("large {$i}");
+            $delivery['entry']['ReplacementEmailContent']['ReplacementTemplate']['ReplacementTemplateData'] = json_encode(['name' => str_repeat('x', 1500000)]);
+            $batch[] = $delivery;
+        }
+        $store->enqueueBatches([$batch], 'scope');
+        // 1.5 MB per entry: the first statement ends with the third row, at 4.5 MB, and the second takes the other two.
+        self::assertCount(2, preg_grep('/^INSERT INTO ses_bulk_deliveries /', $log->sql));
+        self::assertSame(5, (int) $em->getConnection()->fetchOne('SELECT COUNT(*) FROM ses_bulk_deliveries'));
+    }
+
+    public function testFinalOutcomesDropTheRequestData(): void
+    {
+        $em = self::manager();
+        $db = $em->getConnection();
+        $store = new DeliveryStore($em);
+        $store->install();
+        $claim = static fn (string $name): array => $store->claim($store->enqueue(self::delivery($name), 'scope'), 'scope', 'worker');
+        $store->complete($claim('accepted'), 'accepted', '', 'ses-id');
+        $store->complete($claim('rejected'), 'rejected', 'MESSAGE_REJECTED');
+        $store->complete($claim('retry'), 'retry', 'TRANSIENT_FAILURE');
+        $store->enqueue(self::delivery('exhausted'), 'scope');
+        $db->executeStatement('UPDATE ses_bulk_deliveries SET attempts = 3 WHERE id = ?', [hash('sha256', 'exhausted')]);
+        $store->complete($store->claim(hash('sha256', 'exhausted'), 'scope', 'worker'), 'retry', 'TRANSIENT_FAILURE');
+        $expired = $claim('expired');
+        $db->executeStatement('UPDATE ses_bulk_deliveries SET updated_at = 0 WHERE id = ?', [$expired['id']]);
+        self::assertSame(1, $store->expireClaims('scope'));
+        $sending = $claim('event');
+        $store->recordEvent(['mail' => ['messageId' => 'ses-id', 'tags' => ['mautic_delivery_id' => [$sending['id']]]]], 'Delivery');
+
+        $rows = $db->fetchAllAssociativeIndexed('SELECT id, state, reason, entry FROM ses_bulk_deliveries');
+        $expected = [
+            'accepted' => ['accepted', '', ''],
+            'rejected' => ['rejected', 'MESSAGE_REJECTED', ''],
+            'retry' => ['retry', 'TRANSIENT_FAILURE', json_encode(self::delivery('retry')['entry'], JSON_THROW_ON_ERROR)],
+            'exhausted' => ['rejected', 'retry_exhausted:TRANSIENT_FAILURE', ''],
+            'expired' => ['unknown', 'worker_interrupted', ''],
+            'event' => ['accepted', '', ''],
+        ];
+        foreach ($expected as $name => $row) {
+            self::assertSame($row, array_values($rows[hash('sha256', $name)]), $name);
+        }
+    }
+
+    public function testFinalRawDeliveryDropsItsContentWhileSharedContentStays(): void
+    {
+        $em = self::manager();
+        $db = $em->getConnection();
+        $store = new DeliveryStore($em);
+        $store->install();
+        $ids = [];
+        foreach (['accepted', 'expired', 'event', 'retry'] as $name) {
+            $ids[$name] = $store->enqueue(self::raw($name), 'scope');
+        }
+        // Two recipients of one bulk message share their content.
+        $ids['bulk accepted'] = $store->enqueue(self::delivery('bulk accepted'), 'scope');
+        $ids['bulk pending'] = $store->enqueue(self::delivery('bulk pending'), 'scope');
+        $store->complete($store->claim($ids['accepted'], 'scope', 'worker'), 'accepted', '', 'ses-id');
+        $store->complete($store->claim($ids['bulk accepted'], 'scope', 'worker'), 'accepted', '', 'ses-id');
+        $store->complete($store->claim($ids['retry'], 'scope', 'worker'), 'retry', 'TRANSIENT_FAILURE');
+        $store->claim($ids['expired'], 'scope', 'worker');
+        $db->executeStatement('UPDATE ses_bulk_deliveries SET updated_at = 0 WHERE id = ?', [$ids['expired']]);
+        self::assertSame(1, $store->expireClaims('scope'));
+        $store->claim($ids['event'], 'scope', 'worker');
+        $store->recordEvent(['mail' => ['messageId' => 'ses-id', 'tags' => ['mautic_delivery_id' => [$ids['event']]]]], 'Send');
+
+        $payloads = $db->fetchAllKeyValue('SELECT d.id, c.payload FROM ses_bulk_deliveries d INNER JOIN ses_bulk_contents c ON c.id = d.content_id');
+        foreach (['accepted', 'expired', 'event'] as $name) {
+            self::assertSame('', $payloads[$ids[$name]], $name);
+        }
+        self::assertSame(json_encode(self::raw('retry')['common'], JSON_THROW_ON_ERROR), $payloads[$ids['retry']]);
+        self::assertSame(json_encode(self::delivery()['common'], JSON_THROW_ON_ERROR), $payloads[$ids['bulk accepted']]);
+        self::assertSame(['bulk' => 1, 'raw' => 1], $db->fetchAllKeyValue("SELECT operation, COUNT(*) FROM ses_bulk_contents WHERE payload <> '' GROUP BY operation ORDER BY operation"));
+
+        // What retryBulk() reads: only rows still due, whose content and entry are intact.
+        $db->executeStatement('UPDATE ses_bulk_deliveries SET next_attempt = 0');
+        $due = $store->due('scope', 100);
+        self::assertEqualsCanonicalizing([$ids['retry'], $ids['bulk pending']], array_column($due, 'id'));
+        foreach ($due as $row) {
+            self::assertNotSame([], $store->content($row['content_id'])['payload']);
+            self::assertIsArray(json_decode($row['entry'], true, 512, JSON_THROW_ON_ERROR));
+        }
+    }
+
+    public function testInstallAddsIndexesMissingFromExistingTables(): void
+    {
+        $em = self::manager();
+        $db = $em->getConnection();
+        self::installWithout($em, 'ses_bulk_state_updated');
+        self::assertArrayNotHasKey('ses_bulk_state_updated', $db->createSchemaManager()->listTableIndexes('ses_bulk_deliveries'));
+
+        (new DeliveryStore($em))->install();
+        $indexes = $db->createSchemaManager()->listTableIndexes('ses_bulk_deliveries');
+        self::assertArrayHasKey('ses_bulk_state_updated', $indexes);
+        self::assertSame(['state', 'updated_at'], $indexes['ses_bulk_state_updated']->getColumns());
+        self::assertSame([], DeliveryStore::createSchemaSql($em));
     }
 
     public function testAcceptedRetryClearsEarlierFailureReason(): void

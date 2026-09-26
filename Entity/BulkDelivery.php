@@ -52,6 +52,7 @@ class BulkDelivery
         $builder->addIndex(['content_id'], 'ses_bulk_content');
         $builder->addIndex(['message_id'], 'ses_bulk_message');
         $builder->addIndex(['synced', 'state'], 'ses_bulk_sync');
+        $builder->addIndex(['state', 'updated_at'], 'ses_bulk_state_updated');
     }
 }
 

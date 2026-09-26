@@ -175,6 +175,11 @@ class AmazonSesTransportBulkTest extends TestCase
         $due = $this->store->enqueue(DeliveryStoreTest::delivery('due'), $scope);
         $done = $this->store->enqueue(DeliveryStoreTest::delivery('done'), $scope);
         $this->store->complete($this->store->claim($done, $scope, 'worker'), 'accepted', '', 'ses-done');
+        $raw = $this->store->enqueue(DeliveryStoreTest::raw('raw done'), $scope);
+        $this->store->complete($this->store->claim($raw, $scope, 'worker'), 'accepted', '', 'ses-raw');
+        // Final rows keep neither their entry nor their raw content, and retryBulk() never reads them.
+        self::assertSame(['', ''], $this->em->getConnection()->fetchFirstColumn("SELECT entry FROM ses_bulk_deliveries WHERE state = 'accepted'"));
+        self::assertSame('', $this->em->getConnection()->fetchOne("SELECT payload FROM ses_bulk_contents WHERE operation = 'raw'"));
         $this->em->getConnection()->executeStatement('UPDATE ses_bulk_deliveries SET next_attempt = 0');
 
         self::assertSame(1, $this->transport()->retryBulk());

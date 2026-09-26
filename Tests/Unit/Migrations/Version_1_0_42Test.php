@@ -39,4 +39,15 @@ class Version_1_0_42Test extends TestCase
         self::assertTrue($db->createSchemaManager()->tablesExist(['ses_bulk_contents', 'ses_bulk_deliveries']));
         self::assertFalse($migration->shouldExecute());
     }
+
+    public function testAddsTheIndexMissingFromAnExistingTable(): void
+    {
+        $em = DeliveryStoreTest::manager();
+        DeliveryStoreTest::installWithout($em, 'ses_bulk_state_updated');
+        $migration = new Version_1_0_42($em, '');
+        self::assertTrue($migration->shouldExecute());
+        $migration->execute();
+        self::assertArrayHasKey('ses_bulk_state_updated', $em->getConnection()->createSchemaManager()->listTableIndexes('ses_bulk_deliveries'));
+        self::assertFalse($migration->shouldExecute());
+    }
 }

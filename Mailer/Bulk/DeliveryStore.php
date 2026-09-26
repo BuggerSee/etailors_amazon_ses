@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace MauticPlugin\AmazonSesBundle\Mailer\Bulk;
 
 use Doctrine\DBAL\Exception\UniqueConstraintViolationException;
+use Doctrine\DBAL\Platforms\AbstractMySQLPlatform;
+use Doctrine\DBAL\Platforms\SqlitePlatform;
 use Doctrine\ORM\EntityManagerInterface;
 use Doctrine\ORM\Tools\SchemaTool;
 use Mautic\EmailBundle\Entity\Stat;
@@ -13,6 +15,16 @@ use MauticPlugin\AmazonSesBundle\Entity\BulkDelivery;
 
 final class DeliveryStore
 {
+    /**
+     * Deliveries inserted by one statement; the rest of a message follows in further statements of its transaction. A
+     * statement also ends once its entries reach BYTES_PER_INSERT: with up to 256 KB of replacement data per recipient,
+     * 200 rows could exceed MariaDB's default max_allowed_packet of 16 MB and fail the whole message on every attempt.
+     */
+    private const ROWS_PER_INSERT = 200;
+    private const BYTES_PER_INSERT = 4 * 1024 * 1024;
+    /** States no delivery leaves for a submission again; rows in them keep only bookkeeping. */
+    private const FINAL_STATES = ['accepted', 'rejected', 'unknown'];
+
     private string $deliveries;
     private string $contents;
     private bool $ready = false;
@@ -28,20 +40,32 @@ final class DeliveryStore
     /**
      * Shared by install() and the plugin migration.
      *
-     * @return string[] CREATE statements for whichever outbox tables do not exist yet
+     * @return string[] CREATE statements for whichever outbox tables, and indexes of existing tables, do not exist yet
      */
     public static function createSchemaSql(EntityManagerInterface $entityManager): array
     {
-        $manager = $entityManager->getConnection()->createSchemaManager();
+        $db = $entityManager->getConnection();
+        $manager = $db->createSchemaManager();
+        $tool = new SchemaTool($entityManager);
         $missing = [];
+        $indexes = [];
         foreach ([BulkContent::class, BulkDelivery::class] as $class) {
             $metadata = $entityManager->getClassMetadata($class);
-            if (!$manager->tablesExist([$metadata->getTableName()])) {
+            $table = $metadata->getTableName();
+            if (!$manager->tablesExist([$table])) {
                 $missing[] = $metadata;
+                continue;
+            }
+            // A table created by an earlier build lacks the indexes added since.
+            $existing = $manager->listTableIndexes($table);
+            foreach ($tool->getSchemaFromMetadata([$metadata])->getTable($table)->getIndexes() as $index) {
+                if (!$index->isPrimary() && !isset($existing[strtolower($index->getName())])) {
+                    $indexes[] = $db->getDatabasePlatform()->getCreateIndexSQL($index, $table);
+                }
             }
         }
 
-        return $missing ? (new SchemaTool($entityManager))->getCreateSchemaSql($missing) : [];
+        return [...($missing ? $tool->getCreateSchemaSql($missing) : []), ...$indexes];
     }
 
     public function install(): void
@@ -76,9 +100,20 @@ final class DeliveryStore
 
         return $this->entityManager->getConnection()->transactional(function () use ($batches, $scope): array {
             $ids = [];
+            $rows = [];
+            $bytes = 0;
             foreach ($batches as $batch) {
-                $ids[] = array_map(fn (array $delivery): string => $this->enqueue($delivery, $scope), $batch);
+                foreach ($batch as $delivery) {
+                    $rows[] = $row = $this->deliveryRow($delivery, $scope);
+                    $bytes += strlen($row['entry']);
+                    if (self::ROWS_PER_INSERT === count($rows) || $bytes >= self::BYTES_PER_INSERT) {
+                        $this->insertDeliveries($rows);
+                        [$rows, $bytes] = [[], 0];
+                    }
+                }
+                $ids[] = array_column($batch, 'id');
             }
+            $this->insertDeliveries($rows);
 
             return $ids;
         });
@@ -88,6 +123,14 @@ final class DeliveryStore
     public function enqueue(array $delivery, string $scope): string
     {
         $this->assertInstalled();
+        $this->insertDeliveries([$this->deliveryRow($delivery, $scope)]);
+
+        return $delivery['id'];
+    }
+
+    /** Saves the delivery's content unless this instance already did, and returns the delivery's outbox row. */
+    private function deliveryRow(array $delivery, string $scope): array
+    {
         $db = $this->entityManager->getConnection();
         $now = time();
         $contentId = hash('sha256', serialize([$scope, $delivery['operation'], $delivery['email_id'], $delivery['common']]));
@@ -105,19 +148,48 @@ final class DeliveryStore
             }
             $this->contentIds[$contentId] = true;
         }
-        try {
-            $db->insert($this->deliveries, [
-                'id' => $delivery['id'], 'content_id' => $contentId, 'email_id' => $delivery['email_id'],
-                'tracking_hash' => $delivery['tracking_hash'], 'scope' => $scope,
-                'entry' => json_encode($delivery['entry'], JSON_THROW_ON_ERROR), 'state' => 'pending',
-                'event' => '', 'reason' => $delivery['reason'], 'message_id' => '', 'attempts' => 0,
-                'next_attempt' => 0, 'updated_at' => $now, 'created_at' => $now, 'claim' => '', 'synced' => 0,
-            ]);
-        } catch (UniqueConstraintViolationException) {
-            // A second worker/re-delivered Messenger job must not reset the first outcome.
-        }
 
-        return $delivery['id'];
+        return [
+            'id' => $delivery['id'], 'content_id' => $contentId, 'email_id' => $delivery['email_id'],
+            'tracking_hash' => $delivery['tracking_hash'], 'scope' => $scope,
+            'entry' => json_encode($delivery['entry'], JSON_THROW_ON_ERROR), 'state' => 'pending',
+            'event' => '', 'reason' => $delivery['reason'], 'message_id' => '', 'attempts' => 0,
+            'next_attempt' => 0, 'updated_at' => $now, 'created_at' => $now, 'claim' => '', 'synced' => 0,
+        ];
+    }
+
+    /**
+     * A second worker/re-delivered Messenger job must not reset the first outcome, so rows whose id exists are skipped.
+     * MySQL/MariaDB and SQLite skip them inside one multi-row statement (INSERT IGNORE would hide other errors too);
+     * other platforms insert row by row.
+     */
+    private function insertDeliveries(array $rows): void
+    {
+        if (!$rows) {
+            return;
+        }
+        $db = $this->entityManager->getConnection();
+        $platform = $db->getDatabasePlatform();
+        if ($platform instanceof AbstractMySQLPlatform) {
+            $onDuplicate = 'ON DUPLICATE KEY UPDATE id = id';
+        } elseif ($platform instanceof SqlitePlatform) {
+            $onDuplicate = 'ON CONFLICT(id) DO NOTHING';
+        } else {
+            foreach ($rows as $row) {
+                try {
+                    $db->insert($this->deliveries, $row);
+                } catch (UniqueConstraintViolationException) {
+                    // Exists already and stays as it is.
+                }
+            }
+
+            return;
+        }
+        $values = implode(', ', array_fill(0, count($rows), '('.implode(', ', array_fill(0, count($rows[0]), '?')).')'));
+        $db->executeStatement(
+            "INSERT INTO {$this->deliveries} (".implode(', ', array_keys($rows[0])).") VALUES {$values} {$onDuplicate}",
+            array_merge(...array_map('array_values', $rows))
+        );
     }
 
     /** Atomic ownership prevents two workers submitting the same delivery. */
@@ -145,11 +217,14 @@ final class DeliveryStore
         // Accepted on a retry drops the earlier attempt's failure reason. Before the first attempt the reason can only be
         // the raw-fallback reason from enqueue() or a reason from release(), and only the raw-fallback reason stays. A
         // failed attempt already replaced that reason with its own, so a raw-fallback row accepted on a retry ends up with
-        // an empty reason.
-        $this->entityManager->getConnection()->executeStatement(
-            "UPDATE {$this->deliveries} SET state = ?, reason = CASE WHEN ? = 'accepted' AND (attempts > 1 OR reason IN ('local_preflight_failure', 'ACCOUNT_DAILY_QUOTA_EXCEEDED')) THEN '' WHEN ? = '' THEN reason ELSE ? END, message_id = CASE WHEN ? = '' THEN message_id ELSE ? END, next_attempt = ?, updated_at = ?, synced = 0 WHERE id = ? AND claim = ? AND state = 'sending'",
-            [$state, $state, $reason, substr($reason, 0, 128), $messageId, $messageId, time() + min(3600, 30 * (2 ** (int) $row['attempts'])), time(), $row['id'], $row['claim']]
+        // an empty reason. A final state drops the request data, which only a later submission would need.
+        $changed = $this->entityManager->getConnection()->executeStatement(
+            "UPDATE {$this->deliveries} SET state = ?, entry = CASE WHEN ? IN ('accepted', 'rejected', 'unknown') THEN '' ELSE entry END, reason = CASE WHEN ? = 'accepted' AND (attempts > 1 OR reason IN ('local_preflight_failure', 'ACCOUNT_DAILY_QUOTA_EXCEEDED')) THEN '' WHEN ? = '' THEN reason ELSE ? END, message_id = CASE WHEN ? = '' THEN message_id ELSE ? END, next_attempt = ?, updated_at = ?, synced = 0 WHERE id = ? AND claim = ? AND state = 'sending'",
+            [$state, $state, $state, $reason, substr($reason, 0, 128), $messageId, $messageId, time() + min(3600, 30 * (2 ** (int) $row['attempts'])), time(), $row['id'], $row['claim']]
         );
+        if ($changed && in_array($state, self::FINAL_STATES, true)) {
+            $this->dropRawPayloads([$row['content_id']]);
+        }
 
         return $state;
     }
@@ -196,9 +271,17 @@ final class DeliveryStore
     /** Expired claims mean unknown acceptance, never permission to resend. */
     public function expireClaims(string $scope): int
     {
-        return $this->entityManager->getConnection()->executeStatement(
-            "UPDATE {$this->deliveries} SET state = 'unknown', reason = 'worker_interrupted', updated_at = ? WHERE scope = ? AND state = 'sending' AND updated_at < ?", [time(), $scope, time() - 600]
+        $db = $this->entityManager->getConnection();
+        $now = time();
+        $expired = $db->executeStatement(
+            "UPDATE {$this->deliveries} SET state = 'unknown', reason = 'worker_interrupted', entry = '', updated_at = ? WHERE scope = ? AND state = 'sending' AND updated_at < ?", [$now, $scope, $now - 600]
         );
+        if ($expired) {
+            // The rows just expired carry $now. Another unknown row found here is final as well.
+            $this->dropRawPayloads($db->fetchFirstColumn("SELECT DISTINCT content_id FROM {$this->deliveries} WHERE state = 'unknown' AND updated_at = ? AND scope = ?", [$now, $scope]));
+        }
+
+        return $expired;
     }
 
     /** Called only after SNS signature/topic authentication by CallbackSubscriber. */
@@ -223,10 +306,29 @@ final class DeliveryStore
         if (($rank[$row['event']] ?? 0) > $rank[$event]) {
             return;
         }
-        $db->executeStatement(
-            "UPDATE {$this->deliveries} SET state = 'accepted', event = ?, message_id = ?, updated_at = ?, synced = 0 WHERE id = ? AND event = ?",
+        $changed = $db->executeStatement(
+            "UPDATE {$this->deliveries} SET state = 'accepted', event = ?, message_id = ?, entry = '', updated_at = ?, synced = 0 WHERE id = ? AND event = ?",
             [$event, (string) ($payload['mail']['messageId'] ?? $row['message_id']), time(), $id, $row['event']]
         );
+        // A row that was final already dropped its raw content when it became final.
+        if ($changed && !in_array($row['state'], self::FINAL_STATES, true)) {
+            $this->dropRawPayloads([$row['content_id']]);
+        }
+    }
+
+    /**
+     * A raw content row belongs to the one delivery whose message it holds, so a final delivery no longer needs it.
+     * Bulk content rows are shared by many deliveries and keep their payload.
+     *
+     * @param string[] $contentIds contents of final deliveries only
+     */
+    private function dropRawPayloads(array $contentIds): void
+    {
+        if ($contentIds) {
+            $this->entityManager->getConnection()->executeStatement(
+                "UPDATE {$this->contents} SET payload = '' WHERE id IN (".implode(', ', array_fill(0, count($contentIds), '?')).") AND operation = 'raw'", $contentIds
+            );
+        }
     }
 
     public function summary(?int $emailId = null): array

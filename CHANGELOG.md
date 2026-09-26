@@ -17,6 +17,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Errors from a nested SNS `Notification` message now propagate to the callback's HTTP response instead of being answered with success.
 - SES event types `Send`, `Reject` and `Rendering Failure` are accepted by the callback and no longer logged as unknown.
 - `aws/aws-sdk-php` requirement raised to `^3.325.1`, the first version whose SES v2 model supports inline template content.
+- The bulk outbox keeps a recipient's request data (and a raw recipient's message) only until the recipient is `accepted`, `rejected` or `unknown`, leaving about 1 KB of bookkeeping per row; it saves recipients with up to 200 rows (and about 4 MB of request data) per `INSERT`, and `ses_bulk_deliveries` gets a `(state, updated_at)` index, which `mautic:ses:bulk install` and the migration `Version_1_0_42` also add to existing outbox tables.
 
 ## [1.0.41] - 2026-09-25
 - `CallbackSubscriber` now unescapes Mautic's `%%` in `mailer_dsn` before parsing it, so an `sns_topic_arn` DSN option saved through the Email settings UI (stored as `arn%%3Aaws%%3A...`) matches the SNS `TopicArn` instead of decoding to `arn%:aws%:...` and rejecting every callback with 403.
