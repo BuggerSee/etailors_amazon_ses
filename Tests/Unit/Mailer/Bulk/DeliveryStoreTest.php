@@ -94,6 +94,17 @@ class DeliveryStoreTest extends TestCase
         self::assertSame('', $recipients[0]['reason']);
     }
 
+    public function testAcceptedFirstAttemptKeepsRawFallbackReason(): void
+    {
+        $store = new DeliveryStore(self::manager());
+        $store->install();
+        $id = $store->enqueue(['operation' => 'raw', 'reason' => 'literal_template_delimiters'] + self::delivery(), 'scope');
+        $store->complete($store->claim($id, 'scope', 'worker'), 'accepted', '', 'ses-id');
+        $recipients = $store->summary(42)['recipients'];
+        self::assertCount(1, $recipients);
+        self::assertSame(['raw', 'accepted', 'literal_template_delimiters'], [$recipients[0]['operation'], $recipients[0]['state'], $recipients[0]['reason']]);
+    }
+
     public function testExpiredClaimsAreUnknownNotRetryable(): void
     {
         $em = self::manager();
