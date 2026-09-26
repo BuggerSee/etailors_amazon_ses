@@ -268,6 +268,34 @@ Clear Mautic's cache after changing the DSN.
 
 ### Requirements
 
+#### AWS console checklist, mandatory before `bulk=auto`
+
+Do these in this order. Step 3 before step 4 matters: as soon as a configuration set applies to your identity,
+every send is also authorized against it, and an IAM policy without that resource stops all sending, raw included.
+
+1. **SNS subscription** (SNS → Topics → your topic → Subscriptions → the `/mailer/callback` subscription → Edit):
+   *Raw message delivery* off. Put the topic ARN into the DSN as `sns_topic_arn`.
+2. **Configuration set** (SES → Configuration sets → Create, or open an existing one): under *Event destinations*
+   add or edit an SNS destination to the same topic with the event types *Sends*, *Rendering failures*, *Rejects*,
+   *Deliveries*, *Hard bounces* and *Complaints*. Leave *Delivery delays*, *Subscriptions*, *Opens* and *Clicks* off;
+   Mautic tracks opens and clicks itself.
+3. **IAM policy** of the sending user (IAM → Users → the user → Permissions): the send statement needs the actions
+   `ses:SendEmail`, `ses:SendRawEmail` and `ses:SendBulkEmail`, and its `Resource` list needs
+   `arn:aws:ses:<region>:<account>:configuration-set/*` next to the identity ARNs (or `*`).
+4. **Identity default** (SES → Verified identities → the identity of your From address → *Configuration set* tab):
+   assign the configuration set as the default. Use the most specific verified identity: an email-address identity
+   overrides the domain identity.
+5. **Identity feedback notifications** (same identity → *Notifications* tab): remove the SNS topic from *Delivery*,
+   and from *Bounce* and *Complaint* if SES lets you (it may require email feedback forwarding first). The
+   configuration set now delivers these events with the message tags the outbox needs; leaving both on doubles the
+   callbacks per email.
+
+Verify with one send: `bin/console mautic:ses:bulk status --email-id=<id>` must show the recipient as `bulk` /
+`accepted` and, within seconds, an SES event of `delivered`. No event means the configuration set is not applied to
+the identity that sent the mail (step 4); `AccessDeniedException` means step 3.
+
+#### Software requirements
+
 - `aws/aws-sdk-php` 3.325.1 or newer (the plugin requires `^3.325.1`). Older versions lack inline template
   support; eligible emails then fail with an error that asks you to update the SDK.
 - The IAM user also needs `ses:SendBulkEmail`. Without it SES answers `AccessDeniedException`, and the recipients
