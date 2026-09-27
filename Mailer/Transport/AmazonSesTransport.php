@@ -440,88 +440,64 @@ class AmazonSesTransport extends AbstractTransport implements TokenTransportInte
      */
     private function acquireTokens(string $bucketFile, int $tokens, int $rate): void
     {
-        while (true) {
-            $fh = @fopen($bucketFile, 'c+');
-            if (false === $fh) {
-                $message = sprintf(
-                    'Unable to open SES rate limit token bucket file "%s". Please verify that the Mautic cache directory is writable by the web server/PHP user.',
-                    $bucketFile
-                );
-                $this->logger->error($message);
+        $fh = @fopen($bucketFile, 'c+');
+        if (false === $fh) {
+            $message = sprintf(
+                'Unable to open SES rate limit token bucket file "%s". Please verify that the Mautic cache directory is writable by the web server/PHP user.',
+                $bucketFile
+            );
+            $this->logger->error($message);
 
-                throw new TransportException($message);
-            }
+            throw new TransportException($message);
+        }
 
-            if (!flock($fh, LOCK_EX)) {
-                fclose($fh);
-                $message = sprintf('Unable to lock SES rate limit token bucket file "%s".', $bucketFile);
-                $this->logger->error($message);
+        if (!flock($fh, LOCK_EX)) {
+            fclose($fh);
+            $message = sprintf('Unable to lock SES rate limit token bucket file "%s".', $bucketFile);
+            $this->logger->error($message);
 
-                throw new TransportException($message);
-            }
+            throw new TransportException($message);
+        }
 
-            $data = fread($fh, 256);
-            $bucket = $data ? json_decode($data, true) : null;
-            $now = microtime(true);
+        $data = fread($fh, 256);
+        $bucket = $data ? json_decode($data, true) : null;
+        $now = microtime(true);
 
-            if (!$bucket || !isset($bucket['tokens'], $bucket['last_time'])) {
-                $bucket = ['tokens' => 0.0, 'last_time' => $now];
-            }
+        if (!$bucket || !isset($bucket['tokens'], $bucket['last_time'])) {
+            $bucket = ['tokens' => 0.0, 'last_time' => $now];
+        }
 
-            // Refill tokens based on elapsed time, cap at rate
-            $elapsed = $now - $bucket['last_time'];
-            $bucket['tokens'] = min((float) $rate, $bucket['tokens'] + $elapsed * $rate);
-            $bucket['last_time'] = $now;
+        // Idle time repays existing reservations but does not accumulate capacity for a burst.
+        $elapsed = $now - $bucket['last_time'];
+        $bucket['tokens'] = min(0.0, (float) $bucket['tokens'] + $elapsed * $rate);
+        $bucket['last_time'] = $now;
 
-            if ($bucket['tokens'] >= $tokens) {
-                $bucket['tokens'] -= $tokens;
-                if (!ftruncate($fh, 0)) {
-                    flock($fh, LOCK_UN);
-                    fclose($fh);
-                    $message = sprintf('Unable to truncate SES rate limit token bucket file "%s".', $bucketFile);
-                    $this->logger->error($message);
+        // Reserve capacity while holding the lock so workers sharing this file queue behind the same debt.
+        // Wait outside the lock before submitting the reserved recipients.
+        $bucket['tokens'] -= $tokens;
+        $waitUs = (int) ceil((-$bucket['tokens'] / $rate) * 1_000_000);
 
-                    throw new TransportException($message);
-                }
-                rewind($fh);
-                if (false === fwrite($fh, json_encode($bucket))) {
-                    flock($fh, LOCK_UN);
-                    fclose($fh);
-                    $message = sprintf('Unable to write SES rate limit token bucket file "%s".', $bucketFile);
-                    $this->logger->error($message);
-
-                    throw new TransportException($message);
-                }
-                flock($fh, LOCK_UN);
-                fclose($fh);
-                return;
-            }
-
-            // Not enough tokens — save current state so next iteration sees elapsed time,
-            // then release lock and sleep outside
-            $deficit = $tokens - $bucket['tokens'];
-            $waitUs = (int) ceil(($deficit / $rate) * 1_000_000);
-
-            if (!ftruncate($fh, 0)) {
-                flock($fh, LOCK_UN);
-                fclose($fh);
-                $message = sprintf('Unable to truncate SES rate limit token bucket file "%s".', $bucketFile);
-                $this->logger->error($message);
-
-                throw new TransportException($message);
-            }
-            rewind($fh);
-            if (false === fwrite($fh, json_encode($bucket))) {
-                flock($fh, LOCK_UN);
-                fclose($fh);
-                $message = sprintf('Unable to write SES rate limit token bucket file "%s".', $bucketFile);
-                $this->logger->error($message);
-
-                throw new TransportException($message);
-            }
+        if (!ftruncate($fh, 0)) {
             flock($fh, LOCK_UN);
             fclose($fh);
+            $message = sprintf('Unable to truncate SES rate limit token bucket file "%s".', $bucketFile);
+            $this->logger->error($message);
 
+            throw new TransportException($message);
+        }
+        rewind($fh);
+        if (false === fwrite($fh, json_encode($bucket))) {
+            flock($fh, LOCK_UN);
+            fclose($fh);
+            $message = sprintf('Unable to write SES rate limit token bucket file "%s".', $bucketFile);
+            $this->logger->error($message);
+
+            throw new TransportException($message);
+        }
+        flock($fh, LOCK_UN);
+        fclose($fh);
+
+        if ($waitUs > 0) {
             usleep($waitUs);
         }
     }
